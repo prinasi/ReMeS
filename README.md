@@ -178,12 +178,14 @@ Related research on triangle splatting, differentiable meshes, and surface recon
 If you find T<sup>2</sup>-Splat useful for your research, please cite our paper:
 
 ```bibtex
-@inproceedings{tang2026t2splat,
-  title     = {{T$^2$-Splat}: Adaptive Topology Mesh Splatting with Texture Residuals},
-  author    = {Tang, Zhihao and Zhang, Youjia and Zhao, Mingbo and Yang, Wei},
-  booktitle = {Advances in Neural Information Processing Systems},
-  year      = {2026},
-  url       = {https://t2-splat.github.io/}
+@misc{tang2026t2splatadaptivetopologymesh,
+      title={T$^2$-Splat: Adaptive Topology Mesh Splatting with Texture Residuals},
+      author={Zhihao Tang and Youjia Zhang and Mingbo Zhao and Wei Yang},
+      year={2026},
+      eprint={2611.06974},
+      archivePrefix={arXiv},
+      primaryClass={cs.CV},
+      url={https://arxiv.org/abs/2611.06974},
 }
 ```
 
