@@ -1,0 +1,12 @@
+# Geometry diagnostic (D4): controlled Suzanne scenes with GT geometry, Synthetic4Relight preset.
+#   bash scripts/run.sh synthetic4relight 0 suzanne_glossy --config configs/overrides/synthgeo.yaml
+data:
+  root: data/SynthGeo
+  output: output/synthgeo
+pipeline:
+  texture: false
+  image_metrics: false
+scenes:
+  suzanne_diffuse: {}
+  suzanne_glossy: {}
+  suzanne_textured: {}

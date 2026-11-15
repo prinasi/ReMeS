@@ -345,9 +345,66 @@ Findings
 - With layering, oracle roughness MSE rose (0.074 → 0.118; hotdog 0.24, air_baloons 0.16): roughness is
   poorly constrained on these faceted meshes; revisit with geometry / priors.
 
+## Geometry diagnostic (2026-11-15)
+Scripts: `scripts/diagnose_geometry.py` (D1/D2), `scripts/make_geometry_variants.py` + `scripts/geomvar_eval.sh`
+(D3), `relight/blender/make_synthetic.py` + `scripts/synthgeo_all.sh` + `scripts/eval_geometry_gt.py` (D4),
+filters in `relight/geomfilter.py`. Outputs: `output/synthetic4relight/<scene>/geometry_diagnostic/`,
+`output/geomvar/`, `output/synthgeo*/`.
+
+**D1 — error profile (4 real scenes).** "Layering" = share of camera rays that hit a second surface
+within 1 median edge length behind the first hit (clean mesh: 0.5%).
+
+| Scene | Bump RMS (edges) | Normal dev. vs smoothed, median / p90 | Layering <1 / <3 edges |
+|---|---|---|---|
+| air_baloons | 0.41 | 33° / 77° | 86% / 90% |
+| chair | 0.45 | 41° / 79° | 94% / 97% |
+| hotdog | 0.45 | 34° / 77° | 91% / 95% |
+| jugs | 0.41 | 31° / 76° | 85% / 92% |
+
+T²-Splat's opaque triangles form a crumpled multi-sheet shell: small displacements (~0.4 edges) but
+steep facets, stacked 2+ deep almost everywhere.
+
+**D2 — attribution (GT roughness / albedo maps).** Normal deviation is higher on glossy pixels where
+they are common (jugs 39° vs 21°, hotdog 28° vs 21°, air_baloons 26° vs 23°) and on strongly textured
+pixels in 3/4 scenes (+6–8°).
+
+**D4 — controlled scenes with GT geometry** (Suzanne on a slab, Synthetic4Relight cameras + envmap3,
+only the object material changes). Distances in % of the object diagonal.
+
+| Material | Mesh | Accuracy mean / median | Completeness mean | Normal error face / smooth (median) | Screen normal MAE | Layering |
+|---|---|---|---|---|---|---|
+| diffuse | T²-Splat | 0.098 / 0.042 | 0.073 | 5.0° / 5.0° | 9.5° | 87% |
+| diffuse | + Poisson | 0.109 / 0.053 | 0.138 | 5.5° / 4.5° | 5.0° | 0% |
+| textured | T²-Splat | 0.098 / 0.032 | 0.058 | 7.0° / 6.7° | 8.5° | 80% |
+| textured | + Poisson | 0.084 / 0.046 | 0.117 | 5.7° / 4.5° | 4.7° | 0% |
+| glossy | T²-Splat | 0.443 / 0.157 | 0.158 | 20.3° / 17.3° | 20.4° | 86% |
+| glossy | + Poisson | 0.649 / 0.216 | 0.262 | 17.1° / 15.5° | 16.3° | 0% |
+
+**D3 — downstream sensitivity** (jugs + hotdog, oracle light; Poisson depth 9 single-sheet remesh;
+Taubin smoothing rejected: silhouette IoU drops to 0.73–0.90 on these meshes).
+
+| Mesh | Test mask IoU | Albedo aligned | Rough MSE | Relight env6 / env12 (ReMeS) | Parity Cycles-direct vs ReMeS | Cycles GI vs GT env6 / env12 |
+|---|---|---|---|---|---|---|
+| T²-Splat (orig) | 0.997 | 23.13 | 0.144 | 26.17 / 25.62 | 24.6 / 24.2 | 22.0 / 21.4 |
+| Poisson, vis_tmin 10 | 0.96–0.97 | 23.63 | 0.100 | 25.73 / 25.43 | 32.6 / 33.0 | 24.9 / 24.5 |
+| Poisson, vis_tmin 1 | 0.96–0.97 | 22.59 | 0.103 | 25.60 / 25.34 | 34.8 / 35.5 | 24.5 / 24.1 |
+
+Conclusions
+1. **View-dependent appearance is the root cause of geometric error.** With identical geometry, cameras
+   and light, a glossy material makes T²-Splat's surface 4.5× less accurate and its normals 4× worse
+   than a diffuse one (SH cannot represent the reflections, geometry compensates). Post-hoc remeshing
+   does not fix it (real displacement, not noise). Texture leakage is minor (+2° normal error).
+2. **Layering is a separate structural defect** of the triangle representation (80–94% everywhere, even
+   for diffuse objects whose surface position is accurate). It dominates engine behaviour: a single-sheet
+   mesh raises Cycles/ReMeS parity by +8–11 dB and Cycles-GI-vs-GT relighting by ~+3 dB, and roughness
+   error drops ~30%. Poisson costs ~3% silhouette IoU (thin structures, edges), which lowers masked NVS.
+3. Hence the geometry work splits into (a) an appearance model inside reconstruction that can explain
+   specular reflection (and ties it to the normal), and (b) single-surface output (anti-layering
+   regularisation during training and/or silhouette-preserving surface extraction).
+
 ## 6. Immediate next steps
-1. Phase 4: one-bounce indirect from textured hits in training (albedo over-brightening, Cycles GI gap).
-2. Geometry quality (the dominant limit on parity, roughness and glossy surfaces): smoother surfaces /
-   normal refinement, or unfreezing geometry (Phase 6).
-3. Light: higher-resolution or SG+map hybrid for sharp sources; priors for the absolute scale.
-4. Export: optionally per-face residual textures; EEVEE renders alongside Cycles.
+1. Geometry (prerequisite for Phase 4): (a) view-dependent appearance model in the T²-Splat stage
+   (options: diffuse + reflection-direction specular, PBR split-sum with learnable light, MLP);
+   (b) single-surface output (anti-layering regulariser and/or silhouette-preserving extraction).
+   Evaluate on SynthGeo (GT geometry: glossy must approach diffuse) and downstream on Synthetic4Relight.
+2. Then Phase 4 (indirect), on the improved geometry.
