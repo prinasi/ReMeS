@@ -444,7 +444,34 @@ inherited from the visual-hull roof; free per-corner colour can bake shading/sha
 (shadow-aware shading or depth priors would) — this dominates mean accuracy (0.43–0.59); (2) concavities the hull
 cannot carve need insertion / longer optimisation.
 
+### Real scenes with the new geometry (2026-11-16)
+Pipeline: `bash scripts/oto_real.sh <gpu> <tag> <scenes...>` (Stage A soup 15k + Stage B Poisson 5k with silhouette
+carving before refinement, then Phase 2 oracle light and Phase 5 Blender). Outputs `output/oto_s4r/v4/<scene>/`.
+Silhouette carving (`relight/oto.py: outside_masks`) removes Poisson faces whose centre projects outside a
+2-px-dilated mask in any view (visual-hull property); carving again after refinement (v3) left unrefined gaps.
+
+Means over the 4 Synthetic4Relight scenes, oracle light (T²-Splat pipeline → new geometry):
+
+| Metric | T²-Splat | New geometry |
+|---|---|---|
+| Normal deviation vs smoothed (median) / layering | 31–41° / 85–94% | 1–7° / 0–5% |
+| Test mask IoU | 0.993–0.997 | 0.987–0.994 |
+| NVS masked / full image | 25.85 / 32.55 | 26.33 / 32.44 |
+| Albedo aligned / raw | 22.16 / 20.70 | 23.19 / 21.89 |
+| Roughness MSE | 0.118 | 0.063 |
+| Relight env6 / env12 (masked) | 25.41 / 25.57 | 27.27 / 26.94 |
+| Relight albedo-aligned env6 / env12 | 23.96 / 23.86 | 26.03 / 25.27 |
+| Blender parity (Cycles direct vs ReMeS) env6 / env12 | 23.8 / 23.7 | 31.0 / 32.2 |
+| **Cycles GI vs GT** masked env6 / env12 | 21.4 / 21.5 | **26.2 / 26.0** |
+| Cycles GI vs GT full image env6 / env12 | 28.4 / 28.4 | 32.5 / 32.5 |
+
+Per scene the only regressions are chair roughness MSE (0.025 → 0.049) and full-image NVS on jugs/chair (silhouette
+IoU 0.987–0.988 vs 0.997). Remaining geometry issues: visual-hull remnants at contact regions (object bases) and
+the textureless-plane bulge.
+
 ## 6. Immediate next steps
-1. Real scenes with the new geometry (Stage A+B) → Phase 2 / 5 metrics vs the T²-Splat-based pipeline.
-2. Textureless ambiguity: shadow/visibility-aware appearance in the geometry stage, or depth priors.
-3. Then Phase 4 (indirect light) on the improved geometry.
+1. Visual-hull remnants / textureless ambiguity: shadow/visibility-aware appearance in the geometry stage (cast
+   shadows constrain depth) or better initialisation; insertion for concavities.
+2. Phase 3 (learned light) and Phase 4 (indirect light) on the new geometry; make `oto_real.sh` the default
+   geometry stage of `relight_all.sh`.
+3. Speed: Stage A ~20 min, Stage B ~6 min per scene (shared GPUs).
