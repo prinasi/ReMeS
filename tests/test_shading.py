@@ -31,7 +31,8 @@ class ShadingTest(unittest.TestCase):
         N = 1000
         n = torch.nn.functional.normalize(torch.randn(N, 3, device="cuda"), dim=-1)
         out = shade(torch.ones(N, 3, device="cuda"), torch.full((N,), 0.5, device="cuda"),
-                    torch.zeros(N, device="cuda"), n, n, torch.ones(N, 512, device="cuda"), self.white, self.lut)
+                    torch.zeros(N, device="cuda"), n, n, torch.ones(N, 512, device="cuda"), self.white, self.lut,
+                    layering=False)
         self.assertLess((out["irradiance"] / math.pi - 1).abs().max().item(), 0.03)
         self.assertLess((out["diffuse"] - 1).abs().max().item(), 0.03)
 
@@ -73,6 +74,38 @@ class ShadingTest(unittest.TestCase):
         rel = ((out["specular"] - ref).abs().sum(-1) / ref.sum(-1).clamp_min(1e-3)).median().item()
         self.assertLess(rel, 0.05)
         self.assertLess(out["diffuse"].abs().max().item(), 1e-6)
+
+    def test_learnable_light_furnace_and_gradients(self):
+        from relight.shading import LearnableEnvLight, shade
+        light = LearnableEnvLight(self.dirs, (32, 64), init=1.0).cuda()
+        self.assertAlmostEqual(light.bins.sum(0)[0].item(), 4 * math.pi, delta=1e-3)
+        for lvl in light.levels:
+            self.assertLess((lvl - 1).abs().max().item(), 1e-4)
+        N = 256
+        n = torch.nn.functional.normalize(torch.randn(N, 3, device="cuda"), dim=-1)
+        out = shade(torch.full((N, 3), 0.5, device="cuda"), torch.full((N,), 0.3, device="cuda"),
+                    torch.zeros(N, device="cuda"), n, n, torch.ones(N, 512, device="cuda"), light.refresh(), self.lut)
+        out["rgb"].sum().backward()
+        g = light.log_env.grad
+        self.assertTrue(bool(torch.isfinite(g).all()) and g.abs().sum().item() > 0)
+
+    @unittest.skipUnless(ENV12.is_file(), "envmaps not downloaded")
+    def test_learnable_light_matches_fixed(self):
+        """Same map through LearnableEnvLight and EnvLight gives the same shading."""
+        from relight.envmap import downsample_envmap, load_envmap
+        from relight.shading import EnvLight, LearnableEnvLight, shade
+        env = downsample_envmap(load_envmap(ENV12), 64, 128)
+        fixed = EnvLight(env, self.dirs)
+        learn = LearnableEnvLight(self.dirs, (64, 128)).cuda()
+        with torch.no_grad():
+            learn.log_env.copy_(torch.log(env.clamp_min(1e-6)))
+        learn.refresh()
+        N = 2000
+        n = torch.nn.functional.normalize(torch.randn(N, 3, device="cuda"), dim=-1)
+        args = (torch.full((N, 3), 0.5, device="cuda"), torch.full((N,), 0.4, device="cuda"),
+                torch.zeros(N, device="cuda"), n, n, torch.ones(N, 512, device="cuda"))
+        a, b = shade(*args, fixed, self.lut)["rgb"], shade(*args, learn, self.lut)["rgb"].detach()
+        self.assertLess(((a - b).abs().sum(-1) / a.sum(-1)).mean().item(), 0.03)
 
     def test_visibility_pack_and_convex_mesh(self):
         import trimesh

@@ -269,7 +269,8 @@ Design changes vs the plan above (v1, deliberately simple):
   +2.9 dB, NVS/relight unchanged (jugs sweep 2/5/10 h).
 - Metallic frozen at 0 (Synthetic4Relight is dielectric). 3000 iterations, ~5 min/scene.
 
-Oracle light (envmap3), 50 test views, PSNR inside the GT mask unless noted:
+Oracle light (envmap3), 50 test views, PSNR inside the GT mask unless noted. These runs predate the
+diffuse-layering fix (now `pbr_oracle_nolayer`); current numbers are in the Phase 3 + 5 section.
 
 | Run | NVS | Albedo aligned / raw | Rough MSE | Relight env6 | Relight env12 | NVS full img | Relight env12 full img |
 |---|---|---|---|---|---|---|---|
@@ -291,9 +292,62 @@ Findings
 - Gap to T²-Splat's own appearance (full-image NVS 36.5–42.5 dB) is 5–7 dB: physically based shading
   cannot absorb geometry errors the way SH + face textures can.
 
+## Phase 3 + Phase 5 status (v1 done 2026-11-15)
+Single entry point for the v1 pipeline after Phase 1: `bash scripts/relight_all.sh <gpu> <scenes...>`
+(oracle light → learned light → GLB export + Blender Cycles for both). Tables:
+`python scripts/summarize_pbr.py --runs pbr_oracle pbr_learned --blender`.
+
+**Phase 3 (learned light)** — `train_pbr.py --learn-light`: `LearnableEnvLight` (64×128 log-space HDR,
+grey init from mean radiance, TV 1e-3 on log L, white-balance prior available but off), diffuse bins
+and GGX pyramid rebuilt each iteration with precomputed linear operators (`tests/test_shading.py`
+checks furnace, gradients, and agreement with the fixed `EnvLight`). Albedo/light are defined up to a
+per-channel scale, so relighting is also reported after per-view albedo alignment ("albedo-aligned").
+
+**Phase 5 (engine export)** — `relight/export.py` writes glTF PBR: per-vertex values baked into 4×4
+per-face tiles (T²-Splat layout), baseColor sRGB + metallicRoughness (G/B), smooth normals, Y-up,
+no mipmaps (`tests/test_export.py`: multi-page, axes, exact corner texels). `relight/blender/render_relight.py`
+imports into Blender 5.0 (importer wires Base Color ← texture, Roughness ← G, Metallic ← B), forces
+Principled distribution GGX, renders Cycles (GI and direct-only) at the test cameras.
+`scripts/eval_blender.py` exports with the run's mean albedo alignment and scores 10 views × 2 lights.
+`scripts/check_blender_parity.py` isolates the shading model on a clean sphere.
+
+Shading-model change found in Phase 5: Blender's Principled v2 attenuates diffuse by the specular layer's
+directional albedo; ReMeS now does the same (`shade(..., layering=True)`, `--no-layering` for old runs).
+Clean-sphere parity (Cycles direct vs ReMeS, envmap12): 33.6 / 36.5 / 40.0 dB → **47.0 / 46.2 / 45.4 dB**
+(roughness 0.2 / 0.5 / 0.9), brightness ratio 0.94–0.96 → 0.98–0.99. Runs before the change are kept as
+`pbr_{oracle,learned}_nolayer`.
+
+ReMeS renderer, 50 test views, PSNR inside GT mask (means over 4 scenes):
+
+| Run | NVS | Albedo aligned / raw | Rough MSE | Relight env6 / env12 | Relight albedo-aligned env6 / env12 | Light PSNR (aligned) |
+|---|---|---|---|---|---|---|
+| oracle light | 25.85 | 22.16 / 20.70 | 0.118 | 25.41 / 25.57 | 23.96 / 23.86 | — |
+| learned light | 27.68 | 20.79 / 15.50 | 0.093 | 21.08 / 19.85 | 23.19 / 22.90 | 13.98 |
+
+Blender Cycles, 10 test views, albedo-aligned asset, means over 4 scenes (env6 / env12):
+
+| Run | Mask IoU | Parity (Cycles direct vs ReMeS) | Cycles GI vs GT | ReMeS vs GT | Cycles GI vs GT (full img) |
+|---|---|---|---|---|---|
+| oracle light | 1.000 | 23.84 / 23.68 | 21.38 / 21.52 | 23.81 / 23.79 | 28.38 / 28.43 |
+| learned light | 1.000 | 23.38 / 23.53 | 20.99 / 20.83 | 23.11 / 22.82 | 27.96 / 27.75 |
+
+Findings
+- The whole pipeline runs end to end (images → mesh → materials + light → GLB → Cycles); glTF round trip
+  is exact (mask IoU 1.000), material wiring correct.
+- Learned light costs ~0.8 dB albedo-aligned relighting and 1.4 dB albedo vs the oracle; it fits the
+  training views better (NVS +1.8 dB) by absorbing model/geometry errors into the light. Recovered light
+  is low-frequency (13–16 dB vs GT); no sharp sun/horizon.
+- Scene parity (~23.5 dB) is far below clean-sphere parity (~46 dB): the gap is geometric — Cycles
+  traces exact per-pixel shadows on the bumpy T²-Splat surface (visible pitting), ReMeS uses smoothed
+  per-vertex visibility with `vis_tmin`. Exact-start visibility in ReMeS closes only ~1 dB (jugs).
+- Cycles GI scores ~2.4 dB below the ReMeS renderer against GT: albedo trained without interreflections
+  is too bright, and Cycles adds real interreflections on top → Phase 4 (indirect-aware training).
+- With layering, oracle roughness MSE rose (0.074 → 0.118; hotdog 0.24, air_baloons 0.16): roughness is
+  poorly constrained on these faceted meshes; revisit with geometry / priors.
+
 ## 6. Immediate next steps
-1. Phase 3: learnable HDR envmap (log space) + white-balance prior; compare against the Phase 2 oracle.
-2. Phase 5 early (whole pipeline first): PBR GLB export (vertex attributes → per-face tiles) and
-   Blender Cycles relighting under envmap6/12 — engine-relight PSNR.
-3. Phase 4: one-bounce indirect from textured hits (addresses albedo over-brightening).
-4. Later: geometry quality (smooth normals / normal refinement), per-face residual textures.
+1. Phase 4: one-bounce indirect from textured hits in training (albedo over-brightening, Cycles GI gap).
+2. Geometry quality (the dominant limit on parity, roughness and glossy surfaces): smoother surfaces /
+   normal refinement, or unfreezing geometry (Phase 6).
+3. Light: higher-resolution or SG+map hybrid for sharp sources; priors for the absolute scale.
+4. Export: optionally per-face residual textures; EEVEE renders alongside Cycles.

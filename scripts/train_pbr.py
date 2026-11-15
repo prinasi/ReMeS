@@ -1,4 +1,7 @@
-"""Phase 2: PBR material optimisation on a frozen mesh under a known (oracle) light.
+"""Phase 2/3: PBR material optimisation on a frozen mesh.
+
+Phase 2 (default): known (oracle) training light. Phase 3 (``--learn-light``): the
+training light is a learnable log-space HDR envmap optimised jointly with materials.
 
 Inputs : <model>/relight_mesh.pt (scripts/prepare_relight_mesh.py), Synthetic4Relight
          train views (linear HDR + mask), envmaps (training light + relight lights).
@@ -12,7 +15,9 @@ Evaluation (InvRender protocol, display = clip(x^(1/2.2))):
   albedo   test/*_albedo.png decoded with x^2.2, per-channel least-squares scale
            alignment, PSNR on display values inside the mask (raw = no alignment);
   rough    MSE vs test/*_rough.png inside the mask;
-  relight  test_rli/envmap{6,12}_*.png rendered with those envmaps.
+  relight  test_rli/envmap{6,12}_*.png rendered with those envmaps; "aligned" variants
+           first rescale albedo by the per-view albedo alignment (needed for an
+           unknown light: albedo and light are only defined up to a per-channel scale).
 """
 from __future__ import annotations
 
@@ -36,7 +41,8 @@ from relight.gbuffer import rasterize  # noqa: E402
 from relight.io import gamma_to_linear, psnr, tonemap, write_png  # noqa: E402
 from relight.material import PBRMaterial, unique_edges  # noqa: E402
 from relight.mesh import load_relight_mesh  # noqa: E402
-from relight.shading import EnvLight, brdf_lut, fibonacci_sphere, shade  # noqa: E402
+from relight.shading import EnvLight, LearnableEnvLight, brdf_lut, fibonacci_sphere, shade  # noqa: E402
+from relight.envmap import downsample_envmap  # noqa: E402
 from relight.visibility import cached_vertex_visibility, interpolate_visibility  # noqa: E402
 
 SKIP_TOP_ROWS = 5   # hotdog train EXRs have their top rows zeroed (dataset artifact)
@@ -69,13 +75,19 @@ def build_pixel_cache(mesh, ds: Synthetic4Relight, alpha_thr: float) -> dict:
             "rgb": torch.cat(rgbs), "centers": torch.stack(centers).cuda()}
 
 
-def shade_points(mesh, mat, vis_packed, light, lut, face_id, bary, cam_pos, so=True):
+LAYERING = True   # set from --no-layering in main()
+
+
+def shade_points(mesh, mat, vis_packed, light, lut, face_id, bary, cam_pos, so=True, albedo_scale=None):
     n = shading_normal(mesh, face_id, bary)
     x = surface_point(mesh, face_id, bary)
     v = F.normalize(cam_pos - x, dim=-1)
     m = mat.sample(face_id, bary)
+    if albedo_scale is not None:
+        m["albedo"] = (m["albedo"] * albedo_scale).clamp(0, 1)
     vis = interpolate_visibility(vis_packed, mesh.faces, face_id, bary)
-    out = shade(m["albedo"], m["rough"], m["metal"], n, v, vis, light, lut, specular_occlusion=so)
+    out = shade(m["albedo"], m["rough"], m["metal"], n, v, vis, light, lut, specular_occlusion=so,
+                layering=LAYERING)
     out.update(m)
     return out
 
@@ -115,7 +127,7 @@ def loss_space(x):
 
 # ----------------------------------------------------------------------------- eval
 @torch.no_grad()
-def render_view(mesh, mat, vis_packed, light, lut, cam, chunk=1 << 16, so=True):
+def render_view(mesh, mat, vis_packed, light, lut, cam, chunk=1 << 16, so=True, albedo_scale=None):
     g = rasterize(mesh, cam)
     m = g["mask"]
     fid, bary = g["face_id"][m], g["bary"][m]
@@ -125,7 +137,8 @@ def render_view(mesh, mat, vis_packed, light, lut, cam, chunk=1 << 16, so=True):
            (("rgb", 3), ("albedo", 3), ("rough", 1), ("diffuse", 3), ("specular", 3))}
     outs = {k: [] for k in img}
     for s in range(0, fid.shape[0], chunk):
-        o = shade_points(mesh, mat, vis_packed, light, lut, fid[s:s + chunk], bary[s:s + chunk], cpos, so)
+        o = shade_points(mesh, mat, vis_packed, light, lut, fid[s:s + chunk], bary[s:s + chunk], cpos, so,
+                         albedo_scale)
         for k in img:
             outs[k].append(o[k] if o[k].ndim == 2 else o[k][:, None])
     for k in img:
@@ -144,10 +157,11 @@ def aligned_albedo_psnr(pred_lin, gt_lin, mask):
 
 
 @torch.no_grad()
-def evaluate(mesh, mat, vis_packed, lights, lut, ds, stride, img_dir: Path | None, n_vis=4, so=True):
+def evaluate(mesh, mat, vis_packed, lights, train_light, lut, ds, stride, img_dir: Path | None, n_vis=4, so=True):
     rows = {k: [] for k in ("nvs_psnr_mask", "nvs_psnr_full", "albedo_psnr_aligned", "albedo_psnr_raw",
                             "rough_mse", *[f"relight_{e}_psnr_mask" for e in RELIGHT_ENVMAPS],
-                            *[f"relight_{e}_psnr_full" for e in RELIGHT_ENVMAPS])}
+                            *[f"relight_{e}_psnr_full" for e in RELIGHT_ENVMAPS],
+                            *[f"relight_{e}_psnr_mask_aligned" for e in RELIGHT_ENVMAPS])}
     scales = []
     idx = list(range(0, ds.num_views("test"), stride))
     vis_idx = set(idx[:: max(1, len(idx) // n_vis)][:n_vis])
@@ -155,7 +169,7 @@ def evaluate(mesh, mat, vis_packed, lights, lut, ds, stride, img_dir: Path | Non
         tv = ds.test_view(i)
         gm = torch.from_numpy(tv.mask).cuda()
         mask = gm > 0.5
-        out = render_view(mesh, mat, vis_packed, lights[TRAIN_ENVMAP], lut, tv.camera, so=so)
+        out = render_view(mesh, mat, vis_packed, train_light, lut, tv.camera, so=so)
         pred = tonemap(out["rgb"])
         gt = torch.from_numpy(tv.rgb).cuda()
         rows["nvs_psnr_mask"].append(psnr(pred, gt, mask))
@@ -176,6 +190,9 @@ def evaluate(mesh, mat, vis_packed, lights, lut, ds, stride, img_dir: Path | Non
             rows[f"relight_{e}_psnr_mask"].append(psnr(p_rel, g_rel, a_rel > 0.5))
             rows[f"relight_{e}_psnr_full"].append(psnr(p_rel * o["mask"][..., None], g_rel * a_rel[..., None]))
             relit[e] = (p_rel * o["mask"][..., None], g_rel * a_rel[..., None])
+            o2 = render_view(mesh, mat, vis_packed, lights[e], lut, tv.camera, so=so,
+                             albedo_scale=torch.tensor(sc, device="cuda"))
+            rows[f"relight_{e}_psnr_mask_aligned"].append(psnr(tonemap(o2["rgb"]), g_rel, a_rel > 0.5))
         if img_dir is not None and i in vis_idx:
             gray = lambda x: x.expand(*x.shape[:2], 3)
             top = torch.cat([gt * gm[..., None], pred * out["mask"][..., None],
@@ -199,6 +216,11 @@ def main():
     p.add_argument("--data", default=str(ROOT / "data/Synthetic4Relight"))
     p.add_argument("--out", default="pbr_oracle")
     p.add_argument("--light", default=TRAIN_ENVMAP, help="training light (oracle)")
+    p.add_argument("--learn-light", action="store_true", help="Phase 3: learn the training light")
+    p.add_argument("--light-res", type=int, default=64, help="learnable envmap height (width = 2x)")
+    p.add_argument("--lr-light", type=float, default=2e-2)
+    p.add_argument("--light-tv", type=float, default=1e-3, help="TV on the log envmap")
+    p.add_argument("--light-wb", type=float, default=0.0, help="white-balance prior on the mean light colour")
     p.add_argument("--dirs", type=int, default=512, help="visibility / light directions")
     p.add_argument("--iters", type=int, default=3000)
     p.add_argument("--batch", type=int, default=1 << 17)
@@ -213,10 +235,15 @@ def main():
     p.add_argument("--vis-tmin", type=float, default=10.0,
                    help="shadow rays start this many median edge lengths away (skips local mesh noise)")
     p.add_argument("--no-so", action="store_true", help="ablation: no specular occlusion")
+    p.add_argument("--no-layering", action="store_true",
+                   help="no diffuse attenuation by the specular layer (runs before 2026-11-15 Phase 5)")
     p.add_argument("--alpha-thr", type=float, default=0.99)
     p.add_argument("--eval-stride", type=int, default=4)
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--eval-only", action="store_true", help="reload <out>/material.pt (+ light.pt) and re-evaluate")
     a = p.parse_args()
+    global LAYERING
+    LAYERING = not a.no_layering
     torch.manual_seed(a.seed)
     t0 = time.perf_counter()
 
@@ -246,11 +273,17 @@ def main():
     lut = brdf_lut()
     names = sorted({a.light, TRAIN_ENVMAP, *RELIGHT_ENVMAPS})
     lights = {n: EnvLight(load_envmap(ds.envmap_path(n)), dirs, n) for n in names}
-    light = lights[a.light]
-
     cache = build_pixel_cache(mesh, ds, a.alpha_thr)
     P = cache["face_id"].shape[0]
     print(f"[data] {P:,} interior foreground pixels from {ds.num_views('train')} views")
+
+    if a.learn_light:
+        # grey init: albedo 0.5 under uniform light with ~75% visibility reproduces the mean radiance
+        level = float(cache["rgb"].float().mean()) / (0.5 * 0.75)
+        light = LearnableEnvLight(dirs, (a.light_res, 2 * a.light_res), init=level).cuda()
+        print(f"[light] learnable {a.light_res}x{2 * a.light_res} envmap, grey init {level:.3f}")
+    else:
+        light = lights[a.light]
 
     if a.albedo_init == "data":
         alb0, seen = init_albedo(mesh, vis_packed, light, cache)
@@ -261,19 +294,33 @@ def main():
                       learn_metallic=a.learn_metallic).cuda()
     params = [mat.albedo, mat.rough] + ([mat.metal] if a.learn_metallic else []) + \
              ([mat.residual] if mat.residual is not None else [])
-    opt = torch.optim.Adam(params, lr=a.lr)
+    groups = [{"params": params, "lr": a.lr}]
+    if a.learn_light:
+        groups.append({"params": [light.log_env], "lr": a.lr_light})
+    opt = torch.optim.Adam(groups)
     sched = torch.optim.lr_scheduler.LambdaLR(opt, lambda it: a.lr_final_ratio ** (it / max(a.iters, 1)))
     edges = unique_edges(mesh.faces)
 
     log = []
-    for it in range(1, a.iters + 1):
+    if a.eval_only:
+        ck = torch.load(out_dir / "material.pt", map_location="cuda", weights_only=False)
+        mat.load_state_dict(ck["state_dict"])
+        if a.learn_light:
+            light.log_env.data.copy_(torch.load(out_dir / "light.pt")["log_env"].cuda())
+        prev = out_dir / "metrics.json"
+        log = json.loads(prev.read_text()).get("train_log", []) if prev.is_file() else []
+    for it in range(1, 0 if a.eval_only else a.iters + 1):
         idx = torch.randint(0, P, (a.batch,), device="cuda")
         fid, bary = cache["face_id"][idx].long(), cache["bary"][idx]
         cpos = cache["centers"][cache["cam"][idx].long()]
+        if a.learn_light:
+            light.refresh()
         o = shade_points(mesh, mat, vis_packed, light, lut, fid, bary, cpos, so=not a.no_so)
         l_img = (loss_space(o["rgb"]) - loss_space(cache["rgb"][idx].float())).abs().mean()
         l_smooth = mat.edge_smoothness(edges, (a.smooth_albedo, a.smooth_rough))
         loss = l_img + l_smooth
+        if a.learn_light:
+            loss = loss + a.light_tv * light.tv() + a.light_wb * light.white_balance()
         opt.zero_grad(set_to_none=True)
         loss.backward()
         opt.step()
@@ -285,9 +332,27 @@ def main():
             print(f"[train] it {it:5d}  L1 {l_img.item():.5f}  smooth {float(l_smooth):.5f}  "
                   f"batch PSNR {pp:.2f}  ({time.perf_counter() - t0:.0f}s)", flush=True)
 
-    torch.save({"state_dict": mat.state_dict(), "args": vars(a)}, out_dir / "material.pt")
+    if not a.eval_only:
+        torch.save({"state_dict": mat.state_dict(), "args": vars(a)}, out_dir / "material.pt")
+    light_metrics = {}
+    if a.learn_light:
+        with torch.no_grad():
+            light.refresh()
+            learned = light.env.detach()
+            gt = downsample_envmap(lights[TRAIN_ENVMAP].env, *learned.shape[:2])
+            scale = (learned * gt).sum((0, 1)) / (learned * learned).sum((0, 1))
+            light_metrics = {"light_psnr_aligned": psnr(tonemap(learned * scale), tonemap(gt)),
+                             "light_scale_to_gt": scale.tolist()}
+            from relight.io import write_exr
+            write_exr(out_dir / "learned_envmap.exr", learned.cpu().numpy())
+            write_png(out_dir / "envmap_learned_vs_gt.png",
+                      torch.cat([tonemap(learned * scale), tonemap(gt)], 0).cpu().numpy())
+        if not a.eval_only:
+            torch.save({"log_env": light.log_env.detach().cpu()}, out_dir / "light.pt")
     te = time.perf_counter()
-    metrics = evaluate(mesh, mat, vis_packed, lights, lut, ds, a.eval_stride, out_dir / "images", so=not a.no_so)
+    metrics = evaluate(mesh, mat, vis_packed, lights, light, lut, ds, a.eval_stride, out_dir / "images",
+                       so=not a.no_so)
+    metrics.update(light_metrics)
     metrics.update(seconds_total=time.perf_counter() - t0, seconds_eval=time.perf_counter() - te,
                    args=vars(a), occluded_share=float(occl), train_log=log)
     (out_dir / "metrics.json").write_text(json.dumps(metrics, indent=2))
