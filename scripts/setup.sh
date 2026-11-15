@@ -3,9 +3,10 @@
 set -euo pipefail
 ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 PYTHON=${PYTHON:-python}
-WITH_TNT=false
-if [[ ${1:-} == --with-tnt ]]; then WITH_TNT=true; shift; fi
-if (($#)); then echo 'Usage: bash scripts/setup.sh [--with-tnt]' >&2; exit 2; fi
+# nvdiffrast is always built (ReMeS G-buffers, GLB baking). --with-tnt is accepted for
+# backward compatibility and has no extra effect.
+if [[ ${1:-} == --with-tnt ]]; then shift; fi
+if (($#)); then echo 'Usage: bash scripts/setup.sh' >&2; exit 2; fi
 if [[ -z ${CUDA_HOME:-} ]]; then
     if command -v nvcc >/dev/null 2>&1; then
         CUDA_HOME=$(dirname -- "$(dirname -- "$(command -v nvcc)")")
@@ -19,14 +20,11 @@ export CUDA_HOME
 export PATH="$CUDA_HOME/bin:$PATH"
 export MAX_JOBS=${MAX_JOBS:-4}
 export SETUPTOOLS_USE_DISTUTILS=stdlib
-MODULES=(diff-triangle-mesh-rasterization simple-knn effrdel)
-if $WITH_TNT; then MODULES+=(nvdiffrast); fi
+MODULES=(diff-triangle-mesh-rasterization simple-knn effrdel nvdiffrast)
 for MODULE in "${MODULES[@]}"; do
     echo "Building $MODULE"
     (cd -- "$ROOT/submodules/$MODULE" && "$PYTHON" setup.py build_ext --inplace)
 done
-if $WITH_TNT; then
-    # nvdiffrast imports its version from installed package metadata.
-    "$PYTHON" -m pip install --no-build-isolation --no-deps --no-cache-dir --no-compile "$ROOT/submodules/nvdiffrast"
-fi
+# nvdiffrast imports its version from installed package metadata.
+"$PYTHON" -m pip install --no-build-isolation --no-deps --no-cache-dir --no-compile "$ROOT/submodules/nvdiffrast"
 echo 'Extensions built. Use scripts/run.sh to set the local import paths automatically.'

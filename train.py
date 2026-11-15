@@ -699,6 +699,14 @@ def training(
                 Lweight = lambda_weight * Lweight_pure
                 loss += Lweight
 
+            # Silhouette loss: rendered coverage must match the GT foreground mask.
+            # Suppresses floaters and fills dark foreground regions that a
+            # background-coloured composite cannot disambiguate.
+            if opt.lambda_mask > 0 and getattr(viewpoint_cam, "gt_alpha_mask", None) is not None:
+                rend_alpha = render_pkg["rend_alpha"].clamp(0.0, 1.0)
+                Lmask = torch.abs(rend_alpha - viewpoint_cam.gt_alpha_mask.cuda()).mean()
+                loss += opt.lambda_mask * Lmask
+
             # Vertex depth regularization
             Lvertex_depth_pure = 0.0
             lambda_vertex = opt.lambda_vertex if iteration > opt.start_vertex_opt else 0

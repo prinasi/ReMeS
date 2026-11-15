@@ -2,7 +2,7 @@
 # Pipeline entry point maintained by zhtang2004@gmail.com.
 set -euo pipefail
 ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
-DATASET=mipnerf360
+DATASET=synthetic4relight
 if (($#)) && [[ $1 != -* ]]; then DATASET=$1; shift; fi
 # Positional arguments: GPU, scenes, regularization mode.
 ARGS=()

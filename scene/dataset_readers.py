@@ -400,7 +400,70 @@ def readNerfSyntheticInfo(path, white_background, eval, extension=".png"):
                            ply_path=ply_path)
     return scene_info
 
+def _s4r_cam_infos(dataset, split, white_background):
+    """Synthetic4Relight views as CameraInfo for geometry training.
+
+    Train views: linear HDR EXR -> gamma-2.2 display. Test views: 16-bit gamma-encoded
+    RGBA. Both are returned as RGBA (alpha = soft object mask); Camera premultiplies
+    and train.py / render.py composite over the active (possibly random) background,
+    and alpha drives the silhouette loss (``--lambda_mask``).
+    """
+    from relight.io import tonemap
+    cam_infos = []
+    for idx in range(dataset.num_views(split)):
+        if split == "train":
+            view = dataset.train_view(idx)
+            rgb, alpha = tonemap(view.linear, "gamma"), view.mask
+            mask_path = str(dataset._stem(split, idx)) + "_mask.png"
+        else:
+            view = dataset.test_view(idx, with_materials=False)
+            rgb, alpha = view.rgb, view.mask
+            mask_path = ""
+        rgba = np.concatenate([rgb, alpha[..., None]], axis=-1)
+        image = Image.fromarray(np.clip(rgba * 255.0 + 0.5, 0, 255).astype(np.uint8), "RGBA")
+
+        w2c = view.camera.opencv_w2c()
+        R = np.transpose(w2c[:3, :3])  # stored transposed due to 'glm' in CUDA code
+        T = w2c[:3, 3]
+        fovx = view.camera.fovx
+        fovy = focal2fov(fov2focal(fovx, image.size[0]), image.size[1])
+        image_path = str(dataset._stem(split, idx))
+        cam_infos.append(CameraInfo(uid=idx, R=R, T=T, FovY=fovy, FovX=fovx, image=image,
+                                    image_path=image_path, image_name=f"{split}_{view.camera.name}",
+                                    width=image.size[0], height=image.size[1], mask_path=mask_path))
+    return cam_infos
+
+
+def readSynthetic4RelightInfo(path, white_background, eval):
+    from relight.data import Synthetic4Relight
+    path = os.path.abspath(path)
+    dataset = Synthetic4Relight(os.path.dirname(path), os.path.basename(path))
+    print("Reading Synthetic4Relight train views (linear EXR -> gamma 2.2)")
+    train_cam_infos = _s4r_cam_infos(dataset, "train", white_background)
+    print("Reading Synthetic4Relight test views")
+    test_cam_infos = _s4r_cam_infos(dataset, "test", white_background)
+    if not eval:
+        # Test views are held out for relighting evaluation; never train on them.
+        test_cam_infos = []
+
+    nerf_normalization = getNerfppNorm(train_cam_infos)
+    ply_path = os.path.join(path, "points3d.ply")
+    if not os.path.exists(ply_path):
+        num_pts = 100_000
+        print(f"Generating random point cloud ({num_pts})...")
+        xyz = np.random.random((num_pts, 3)) * 2.6 - 1.3
+        shs = np.random.random((num_pts, 3)) / 255.0
+        storePly(ply_path, xyz, SH2RGB(shs) * 255)
+    try:
+        pcd = fetchPly(ply_path)
+    except Exception:
+        pcd = None
+    return SceneInfo(point_cloud=pcd, train_cameras=train_cam_infos, test_cameras=test_cam_infos,
+                     nerf_normalization=nerf_normalization, ply_path=ply_path)
+
+
 sceneLoadTypeCallbacks = {
     "Colmap": readColmapSceneInfo,
+    "Synthetic4Relight": readSynthetic4RelightInfo,
     "Blender" : readNerfSyntheticInfo
 }

@@ -13,5 +13,5 @@ link = Path(sys.prefix) / 'bin/ffmpeg'
 if not link.exists():
     link.symlink_to(imageio_ffmpeg.get_ffmpeg_exe())
 PYFFMPEG
-bash scripts/setup.sh --with-tnt
+bash scripts/setup.sh
 python -m pip check

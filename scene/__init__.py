@@ -23,6 +23,7 @@ import random
 import json
 from utils.system_utils import searchForMaxIteration
 from scene.dataset_readers import sceneLoadTypeCallbacks
+from relight.data import is_synthetic4relight
 from scene.triangle_model import TriangleModel
 from arguments import ModelParams
 from utils.camera_utils import cameraList_from_camInfos, camera_to_JSON
@@ -58,6 +59,9 @@ class Scene:
                 args.source_path, args.images, args.eval,
                 disable_priors=getattr(args, "disable_priors", False),
             )
+        elif is_synthetic4relight(args.source_path):
+            print("Found transforms_train.json with *_rgb.exr views, assuming Synthetic4Relight data set!")
+            scene_info = sceneLoadTypeCallbacks["Synthetic4Relight"](args.source_path, args.white_background, args.eval)
         elif os.path.exists(os.path.join(args.source_path, "transforms_train.json")):
             print("Found transforms_train.json file, assuming Blender data set!")
             scene_info = sceneLoadTypeCallbacks["Blender"](args.source_path, args.white_background, args.eval)

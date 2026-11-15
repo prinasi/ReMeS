@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""Shared training/evaluation runner. Maintained by zhtang2004@gmail.com."""
+"""Geometry training / evaluation runner for ReMeS (T²-Splat stage).
+
+Dataset presets live in configs/<dataset>.yaml on top of configs/common.yaml.
+"""
 from __future__ import annotations
 
 import argparse
@@ -10,7 +13,6 @@ import math
 import os
 from pathlib import Path
 import re
-import resource
 import shlex
 import subprocess
 import sys
@@ -18,7 +20,8 @@ import sys
 import yaml
 
 ROOT = Path(__file__).resolve().parents[1]
-STAGES = ("geometry", "texture", "render", "metrics", "export", "evaluate")
+STAGES = ("geometry", "texture", "render", "metrics", "export")
+DATASETS = tuple(sorted(p.stem for p in (ROOT / "configs").glob("*.yaml") if p.stem != "common"))
 
 
 class ConfigLoader(yaml.SafeLoader):
@@ -108,7 +111,7 @@ def load_config(args):
             apply_setting(config, key + "=" + os.environ[variable])
     for setting in args.set:
         apply_setting(config, setting)
-    for arg, key in ((args.data_root, "root"), (args.output_root, "output"), (args.gt_root, "gt_root")):
+    for arg, key in ((args.data_root, "root"), (args.output_root, "output")):
         if arg is not None:
             config["data"][key] = arg
     if args.face_tex_res is not None:
@@ -123,8 +126,6 @@ def load_config(args):
         raise ValueError("Iteration counts must be positive")
     if int(config["texture"]["face_tex_res"]) < 1:
         raise ValueError("Texture resolution must be positive")
-    if config["pipeline"]["geometry_eval"] not in {"none", "dtu", "uniform", "virtual_scan", "both"}:
-        raise ValueError("Unknown geometry evaluation protocol")
     return config
 
 
@@ -185,9 +186,8 @@ def make_plan(args, config, name):
         raise ValueError("training.save_iterations must be a list of integers within the training interval")
     training.update(eval=True, save_iterations=sorted(set(save_iterations + [geometry_iter])),
                     test_iterations=[geometry_iter])
-    if args.dataset == "tnt":
-        training.setdefault("scene_name", name)
-    add("geometry", "train.py", ["-s", source, "-i", scene["images"], "-m", output, *cli_options(training)],
+    image_args = ["-i", scene["images"]] if scene.get("images") else []
+    add("geometry", "train.py", ["-s", source, *image_args, "-m", output, *cli_options(training)],
         requires=[source], produces=[checkpoint(output, geometry_iter)])
     if pipeline["texture"]:
         arguments = ["-m", output, "--iteration", geometry_iter, *cli_options(texture)]
@@ -202,39 +202,14 @@ def make_plan(args, config, name):
             produces=[output / "results.json"])
     mesh = output / "mesh.ply"
     if pipeline["export_mesh"]:
-        # Geometry benchmarks retain their original mesh; NVS exports bake full
-        # SH and MipTex into the original vertex RGB without adding triangles.
+        # Bake full SH and MipTex into the original vertex RGB without adding triangles.
         export_options = {"clean": pipeline["mesh_clean"], "manifold": pipeline["mesh_manifold"],
                           "overwrite": True}
         if pipeline["mesh_clean"]:
             export_options["min_faces_ratio"] = mesh_ratio
-        if pipeline["geometry_eval"] != "none":
-            export_options["geometry-only"] = True
         add("export", "create_ply.py", [checkpoint(output, final_iter).parent, "--out", mesh,
                                         *cli_options(export_options)],
             requires=[checkpoint(output, final_iter)], produces=[mesh])
-    protocol = pipeline["geometry_eval"]
-    if protocol == "dtu":
-        gt = absolute(config["data"]["gt_root"])
-        add("evaluate", "eval_dtu/evaluate_dtu_mesh_gof.py",
-            ["-m", output, "--iteration", final_iter, "--ply_name", "mesh.ply", "--DTU", gt, "--mask_dilate", "4",
-             "--workers", "8", "--seed", "0"],
-            requires=[mesh, gt / "ObsMask", gt / "Points/stl"])
-    elif protocol != "none":
-        gt = absolute(config["data"]["gt_root"]) / name
-        trajectory = gt / f"{name}_COLMAP_SfM.log"
-        modes = ("uniform", "virtual_scan") if protocol == "both" else (protocol,)
-        for mode in modes:
-            arguments = ["--dataset-dir", gt, "--traj-path", trajectory, "--ply-path", mesh,
-                         "--out-dir", output / f"tnt_eval_{mode}", "--num-surface-samples", pipeline["eval_samples"]]
-            arguments += ["--input_type", "mesh"] if mode == "uniform" else ["-s", source, "-r", pipeline["eval_resolution"]]
-            eval_output = output / f"tnt_eval_{mode}"
-            products = ([eval_output / f"{name}.prf_tau_plotstr.txt",
-                         eval_output / "evaluation_metadata.json", eval_output / "initial_alignment.txt",
-                         eval_output / "final_alignment.txt"] if mode == "virtual_scan" else [])
-            add("evaluate", f"TNTUniScanEvals/{mode}_sampling_eval.py", arguments,
-                requires=[mesh, trajectory, gt / f"{name}_trans.txt", gt / f"{name}.ply", gt / f"{name}.json"],
-                produces=products, cwd=ROOT / "TNTUniScanEvals")
     if args.only_stage:
         plan = [step for step in plan if step["stage"] == args.only_stage]
     else:
@@ -269,38 +244,6 @@ def mesh_counts(path):
     if set(counts) != {"mesh_vertices", "mesh_faces"} or min(counts.values()) <= 0:
         raise ValueError(f"Empty or invalid exported mesh: {path}")
     return counts
-
-
-def tnt_geometry_metrics(step):
-    """Validate and collect TNT metrics, protocol metadata and mesh counts."""
-    argv = step["argv"]
-    value = lambda flag: argv[argv.index(flag) + 1]
-    directory = Path(value("--out-dir"))
-    scene = Path(value("--dataset-dir")).name
-    raw = directory / f"{scene}.prf_tau_plotstr.txt"
-    values = [float(x) for x in raw.read_text().split()]
-    if len(values) != 5 or not all(math.isfinite(x) for x in values):
-        raise ValueError("Invalid TNT geometry metrics")
-    p, r, f, tau, stretch = values
-    if (not all(0 <= x <= 1 for x in (p, r, f)) or tau <= 0
-            or not math.isclose(f, 2*p*r/(p+r) if p+r else 0, abs_tol=1e-10)):
-        raise ValueError("Invalid TNT Precision/Recall/F-score")
-    metadata = json.loads((directory / "evaluation_metadata.json").read_text())
-    if (metadata["status"] != "complete" or metadata["protocol"] != "virtual_scan_scale_corrected_v1"
-            or metadata["scene"] != scene or metadata["crop_prediction_and_ground_truth"] is not True
-            or metadata["evaluation_resolution"] != int(value("-r"))
-            or Path(metadata["mesh_path"]).resolve() != Path(value("--ply-path")).resolve()
-            or Path(metadata["source_path"]).resolve() != Path(value("-s")).resolve()):
-        raise ValueError("TNT evaluation protocol/source mismatch")
-    metrics = dict(precision=p, recall=r, fscore=f, tau=tau, plot_stretch=stretch)
-    for key, expected in [("precision", p), ("recall", r), ("fscore", f), ("tau_gt_units", tau)]:
-        if not math.isclose(metadata[key], expected, abs_tol=1e-10):
-            raise ValueError(f"TNT evaluation metadata mismatch: {key}")
-    counts = mesh_counts(value("--ply-path"))
-    if any(metadata[key] != count for key, count in counts.items()):
-        raise ValueError("TNT evaluation mesh counts mismatch")
-    return dict(**metrics, **counts, protocol=metadata["protocol"],
-                evaluation_resolution=metadata["evaluation_resolution"], raw_file=str(raw))
 
 
 def run_stage(step, output, env):
@@ -346,18 +289,6 @@ def execute_scene(args, config, name):
                                        str(ROOT / "submodules/diff-triangle-mesh-rasterization"),
                                        str(ROOT / "submodules/simple-knn"), str(ROOT / "submodules/nvdiffrast"), env.get("PYTHONPATH", "")])
     env.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
-    if args.dataset == "dtu":
-        env["DTU_DATA_ROOT"] = str(absolute(config["data"]["root"]))
-        env.update(OMP_NUM_THREADS="8", OPENBLAS_NUM_THREADS="8", MKL_NUM_THREADS="8",
-                   MPLBACKEND="Agg", T2SPLAT_DISABLE_TENSORBOARD="1")
-    if args.dataset == "tnt":
-        # Limit CPU parallelism and allow larger scene inputs.
-        env.update(OMP_NUM_THREADS="8", OPENBLAS_NUM_THREADS="8", MKL_NUM_THREADS="8",
-                   MPLBACKEND="Agg", T2SPLAT_DISABLE_TENSORBOARD="1")
-        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
-        requested = max(soft, 16384)
-        resource.setrlimit(resource.RLIMIT_NOFILE,
-                          (requested if hard == resource.RLIM_INFINITY else min(requested, hard), hard))
     record = {"status": "running", "scene": name, "started_utc": datetime.now(timezone.utc).isoformat(),
               "config": config, "final_iteration": final_iter, "steps": plan, "completed_stages": []}
     status_path = output / "pipeline_status.json"
@@ -370,16 +301,10 @@ def execute_scene(args, config, name):
             record["active_stage"] = step["stage"]
             write_json(status_path, record)
             run_stage(step, output, env)
-            if args.dataset == "tnt" and step["stage"] == "export":
+            if step["stage"] == "export":
                 counts = mesh_counts(output / "mesh.ply")
                 record.update(counts)
                 write_json(output / "triangle_counts.json", counts)
-            if (args.dataset == "tnt" and step["stage"] == "evaluate"
-                    and Path(step["argv"][2]).name == "virtual_scan_sampling_eval.py"):
-                result = tnt_geometry_metrics(step)
-                record["geometry_metrics"] = result
-                write_json(output / "geometry_metrics.json", result)
-                write_json(output / "triangle_counts.json", {key: result[key] for key in ("mesh_vertices", "mesh_faces")})
             if step["stage"] == "metrics":
                 result = json.loads((output / "results.json").read_text())[f"ours_{final_iter}"]
                 if not all(math.isfinite(result[key]) for key in ("PSNR", "SSIM", "LPIPS")):
@@ -398,14 +323,13 @@ def execute_scene(args, config, name):
 
 def parser():
     result = argparse.ArgumentParser(description=__doc__)
-    result.add_argument("--dataset", choices=("mipnerf360", "dtu", "tnt", "tandt"), default="mipnerf360")
+    result.add_argument("--dataset", choices=DATASETS, default="synthetic4relight")
     result.add_argument("--gpu", default="0")
     result.add_argument("--scenes", default="all", help="Comma-separated scene names, or all")
     result.add_argument("--reg-mode", choices=("default", "strong"), default="default")
     result.add_argument("--config", help="Additional YAML overrides (.yaml or .yml)")
     result.add_argument("--data-root")
     result.add_argument("--output-root")
-    result.add_argument("--gt-root")
     result.add_argument("--face-tex-res", type=int)
     result.add_argument("--skip-texture", action="store_true")
     result.add_argument("--no-mip", action="store_true")

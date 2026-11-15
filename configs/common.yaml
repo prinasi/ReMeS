@@ -6,9 +6,6 @@ pipeline:
   export_mesh: true
   mesh_clean: false
   mesh_manifold: false
-  geometry_eval: none
-  eval_samples: 10000000
-  eval_resolution: 2
 
 training:
   iterations: 30000

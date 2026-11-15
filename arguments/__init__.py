@@ -114,7 +114,9 @@ class OptimizationParams(ParamGroup):
         self.visibility_prune_max_face_ratio = 0.02
 
         self.random_background = False
-        
+        # Silhouette loss |rendered alpha - GT mask| (needs RGBA/masked GT); 0 disables.
+        self.lambda_mask = 0.0
+
         self.feature_lr = 0.0016
         self.max_points = 4000000
 

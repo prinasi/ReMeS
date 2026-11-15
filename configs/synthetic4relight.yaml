@@ -1,0 +1,78 @@
+# ReMeS Phase 1: T²-Splat geometry for Synthetic4Relight (object-centric, masked).
+# Derived from upstream T²-Splat's DTU object preset, with two changes for relighting:
+#   * full 30k schedule so opacity reaches 0.9999 (final_opacity_iter) and edge
+#     sigma reaches ~0 (sigma_until): the exported mesh must be opaque/hard-edged;
+#   * RGBA supervision: random background + silhouette loss (lambda_mask).
+
+data:
+  root: data/Synthetic4Relight
+  output: output/synthetic4relight
+  layout: '{scene}'
+
+pipeline:
+  texture: true          # T²-Splat appearance (SH + face texture): NVS reference + Phase 2 sampling test
+  image_metrics: true
+  export_mesh: true
+  mesh_clean: false
+  mesh_min_faces_ratio: 0.01
+  mesh_manifold: false
+
+training:
+  iterations: 30000
+  sigma_until: 30000
+  final_opacity_iter: 24000
+  start_upsampling: 20000
+  feature_lr: 0.004
+  size_probs_zero: 0.0
+  splitt_large_triangles: 500
+  start_pruning: 3000
+  weight_lr: 0.05
+  lambda_weight: 0.0
+  prune_size: 1300
+  densify_until_iter: 10000
+  run_restricted_delaunay: 11000
+  iteration_mesh: 8000
+  lambda_normals: 1.0e-04      # 10x DTU preset: ~40% less normal noise for -0.12..-0.21 dB NVS (Phase 1 ablation)
+  lambda_normals_super: 0.0
+  disable_priors: true
+  depth_lambda_init: 0.0
+  depth_lambda_final: 0.0
+  lambda_vertex: 0.0
+  lr_triangles_points_init: 0.00052
+  prune_triangles_threshold: 0.17
+  random_background: true
+  lambda_mask: 0.1
+  enable_heartbeat: true
+  heartbeat_start_iter: 12000
+  heartbeat_end_iter: 18000
+  heartbeat_interval: 1000
+  heartbeat_collapse_ratio: 0.05
+  heartbeat_split_top_k: 5.0
+  heartbeat_safety: true
+  heartbeat_max_edge_len_ratio: 2.0
+  heartbeat_use_qem: true
+  heartbeat_qem_boundary_weight: 10.0
+  rdt_backend: surface
+  rdt_surface_mode: g
+  rdt_max_distance_ratio: 0.5
+  rdt_min_normal_cos: 0.15
+  rdt_min_quality: 0.02
+  visibility_pruning: legacy
+  final_visibility_threshold: 0.5
+  final_only_monitoring: true
+  topology_monitor_interval: 0
+  save_iterations: [30000]
+
+texture:
+  face_tex_res: 8
+  use_mip_texture: true
+
+scene_defaults:
+  kind: object
+  max_points: 650000
+
+scenes:
+  air_baloons: {}
+  chair: {}
+  hotdog: {}
+  jugs: {}
