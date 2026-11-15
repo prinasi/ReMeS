@@ -102,6 +102,19 @@ def training(
     triangles.training_setup(opt, opt.feature_lr, opt.weight_lr, opt.lr_triangles_points_init)
     triangles.add_percentage = opt.add_percentage
 
+    deferred = None
+    if opt.deferred_spec:
+        from relight.deferred import DeferredSpecular
+        assert triangles.max_sh_degree >= 1, "deferred_spec stores its attributes in _features_rest (sh_degree >= 1)"
+        assert opt.deferred_sh_degree <= 2, "the last _features_rest slot must stay unused by SH"
+        deferred = DeferredSpecular(env_res=opt.deferred_env_res, lr=opt.lr_deferred_env, mode=opt.deferred_mode,
+                                    env_tv=opt.deferred_env_tv, linear=opt.deferred_linear,
+                                    env_init=opt.deferred_env_init, env_freeze=opt.deferred_env_freeze)
+        for group in triangles.optimizer.param_groups:
+            if group["name"] == "f_rest":
+                group["lr"] = opt.lr_deferred_attr
+        print(f"[deferred] reflection-direction specular on; SH degree capped at {opt.deferred_sh_degree}")
+
 
     if checkpoint:
         (model_params, first_iter) = torch.load(checkpoint)
@@ -556,7 +569,7 @@ def training(
         triangles.set_sigma(current_sigma)
 
         # Every 1000 its we increase the levels of SH up to a maximum degree
-        if iteration % 1000 == 0:
+        if iteration % 1000 == 0 and (deferred is None or triangles.active_sh_degree < opt.deferred_sh_degree):
             triangles.oneupSHdegree()
 
         # Inline face texture: bake at first phase, upsample at later phases
@@ -637,6 +650,11 @@ def training(
 
         render_pkg = render(viewpoint_cam, triangles, pipe, bg)
         image = render_pkg["render"]
+        deferred_reg = 0.0
+        if deferred is not None:
+            dpkg = deferred.shade(viewpoint_cam, triangles, pipe, render, render_pkg)
+            image = deferred.compose(image, dpkg["specular"], render_pkg, bg)
+            deferred_reg = dpkg["reg"]
 
         # Loss
         gt_image = viewpoint_cam.original_image.cuda()
@@ -676,7 +694,7 @@ def training(
     
 
         # FINAL LOSS
-        loss = loss_image.clone()
+        loss = loss_image.clone() + deferred_reg
         L_mesh_smooth = 0.0
         L_mesh_edge = 0.0
         L_mesh_nc = 0.0
@@ -939,6 +957,8 @@ def training(
                     redirect_mirror_gradients(triangles.face_textures, inv_r, inv_c, mir_r, mir_c)
                 triangles.optimizer.step()
                 triangles.optimizer.zero_grad(set_to_none = True)
+                if deferred is not None:
+                    deferred.step()
                 if face_tex_mirror is not None and hasattr(triangles, 'face_textures'):
                     mirror_invalid_texels(triangles.face_textures, inv_r, inv_c, mir_r, mir_c)
 
@@ -1092,6 +1112,8 @@ def training(
             save_img_u8(img_np, os.path.join(mesh_viz_dir, "frame_final.png"))
 
     final_checkpoint = scene.save(iteration)
+    if deferred is not None:
+        torch.save(deferred.state_dict(), os.path.join(scene.model_path, "deferred_env.pt"))
     if save_topology_snapshots:
         save_training_snapshot(scene, iteration, "training_complete", final_checkpoint)
     print("Training is done")

@@ -1,0 +1,18 @@
+# Geometry fix (a), iteration e4: linear-space composition, split-sum Fresnel specular, learned env.
+data:
+  root: data/SynthGeo
+  output: output/synthgeo_deferred_e4
+pipeline:
+  texture: false
+  image_metrics: false
+training:
+  deferred_spec: true
+  deferred_sh_degree: 0
+  deferred_mode: 2
+  deferred_linear: true
+  deferred_env_tv: 1.0e-03
+  lr_deferred_env: 0.005
+scenes:
+  suzanne_diffuse: {}
+  suzanne_glossy: {}
+  suzanne_textured: {}

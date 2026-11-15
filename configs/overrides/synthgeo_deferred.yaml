@@ -1,0 +1,15 @@
+# Geometry fix (a): deferred reflection-direction specular in the T²-Splat stage, on SynthGeo.
+#   bash scripts/run.sh synthetic4relight 0 suzanne_glossy --config configs/overrides/synthgeo_deferred.yaml
+data:
+  root: data/SynthGeo
+  output: output/synthgeo_deferred
+pipeline:
+  texture: false
+  image_metrics: false
+training:
+  deferred_spec: true
+  deferred_sh_degree: 0
+scenes:
+  suzanne_diffuse: {}
+  suzanne_glossy: {}
+  suzanne_textured: {}

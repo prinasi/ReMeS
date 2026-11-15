@@ -1,0 +1,18 @@
+# Geometry fix (a), iteration e2: split-sum Fresnel specular branch + env TV, lambda_normals 1e-3.
+data:
+  root: data/SynthGeo
+  output: output/synthgeo_deferred_e2
+pipeline:
+  texture: false
+  image_metrics: false
+training:
+  deferred_spec: true
+  deferred_sh_degree: 0
+  deferred_mode: 2
+  deferred_env_tv: 1.0e-03
+  lr_deferred_env: 0.005
+  lambda_normals: 1.0e-03
+scenes:
+  suzanne_diffuse: {}
+  suzanne_glossy: {}
+  suzanne_textured: {}

@@ -1,0 +1,22 @@
+# Opaque-before-RDT schedule (Triangle Splatting+-style opaque soup remeshed by RDT).
+# Opacity floor 5k->10k (was 24k), sigma -> ~0 by 11k (was 30k), densify until 8k, RDT at 12k on the opaque
+# soup; pre-RDT blending-weight pruning removes sheets hidden behind the visible surface.
+data:
+  root: data/SynthGeo
+  output: output/synthgeo_opaque
+pipeline:
+  texture: false
+  image_metrics: false
+training:
+  final_opacity_iter: 10000
+  sigma_until: 11000
+  densify_until_iter: 8000
+  run_restricted_delaunay: 12000
+  heartbeat_start_iter: 13000
+  heartbeat_end_iter: 19000
+  save_topology_snapshots: true
+  save_iterations: [6000, 9000, 15000, 30000]
+scenes:
+  suzanne_diffuse: {}
+  suzanne_glossy: {}
+  suzanne_textured: {}

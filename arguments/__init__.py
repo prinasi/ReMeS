@@ -116,6 +116,17 @@ class OptimizationParams(ParamGroup):
         self.random_background = False
         # Silhouette loss |rendered alpha - GT mask| (needs RGBA/masked GT); 0 disables.
         self.lambda_mask = 0.0
+        # ReMeS deferred reflection-direction specular (relight/deferred.py)
+        self.deferred_spec = False
+        self.deferred_sh_degree = 0       # SH degree cap while the specular branch is on (<= 2)
+        self.deferred_env_res = 64
+        self.lr_deferred_env = 0.01
+        self.lr_deferred_attr = 0.01      # lr of the f_rest group (holds tint / roughness logits)
+        self.deferred_mode = 1            # 1: additive tint x env, 2: split-sum DFG (Fresnel)
+        self.deferred_env_tv = 0.0        # TV weight on the log env
+        self.deferred_linear = False      # compose (diffuse + specular) in linear space, then gamma
+        self.deferred_env_init = ""       # optional HDR map (exr) to initialise the env from
+        self.deferred_env_freeze = False  # keep the env fixed (oracle-light diagnostics)
 
         self.feature_lr = 0.0016
         self.max_points = 4000000

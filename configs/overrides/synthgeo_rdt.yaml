@@ -1,0 +1,13 @@
+# RDT hypothesis test: baseline T²-Splat on SynthGeo with snapshots around RDT (scripts/analyze_rdt.py).
+data:
+  root: data/SynthGeo
+  output: output/synthgeo_rdt
+pipeline:
+  texture: false
+  image_metrics: false
+training:
+  save_topology_snapshots: true
+  save_iterations: [3000, 6000, 9000, 15000, 30000]
+scenes:
+  suzanne_diffuse: {}
+  suzanne_glossy: {}
