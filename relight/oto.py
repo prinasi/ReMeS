@@ -69,42 +69,19 @@ class OpaqueSoup:
         return F.normalize(torch.cross(v[:, 1] - v[:, 0], v[:, 2] - v[:, 0], dim=-1), dim=-1)
 
     # ------------------------------------------------------------------ rendering
-    def render(self, cam, light, lut, mvp: torch.Tensor | None = None, track_coverage: bool = False) -> dict:
-        dev = self.verts.device
-        V = self.verts.reshape(-1, 3)
-        faces = self.faces()
-        mvp = mvp_matrix(cam).to(dev) if mvp is None else mvp
-        clip = (torch.cat([V, torch.ones_like(V[:, :1])], -1) @ mvp.T)[None].contiguous()
-        rast, _ = dr.rasterize(get_context(dev), clip, faces, resolution=[cam.height, cam.width])
-        tri = rast[0, ..., 3].long() - 1
-        mask = tri >= 0
+    def corner_attributes(self) -> torch.Tensor:
         lo, hi = ROUGH_RANGE
-        attrs = torch.cat([DIFFUSE_MAX * torch.sigmoid(self.diffuse), torch.sigmoid(self.spec[..., :1]),
-                           lo + (hi - lo) * torch.sigmoid(self.spec[..., 1:]), self.verts], -1).reshape(-1, 8)
-        interp, _ = dr.interpolate(attrs[None].contiguous(), rast, faces)
-        interp = interp[0]
-        pos = interp[..., 5:8]
-        o = torch.as_tensor(np.asarray(cam.center), dtype=torch.float32, device=dev)
-        n = torch.zeros_like(pos)
-        n[mask] = self.face_normals()[tri[mask]]
-        d = F.normalize(pos - o, dim=-1)
-        n = torch.where(((n * d).sum(-1, keepdim=True) > 0), -n, n)                  # face the camera
-        rgb = interp[..., 0:3].clone()
-        if light is not None and mask.any():
-            dm, nm = d[mask], n[mask]
-            refl = F.normalize(dm - 2 * (dm * nm).sum(-1, keepdim=True) * nm, dim=-1)
-            rho = interp[..., 4][mask]
-            nv = (-(dm * nm).sum(-1)).clamp(1e-4, 1)
-            ab = lookup_lut(lut, nv, rho)
-            spec = light.specular(refl, rho) * (interp[..., 3][mask][:, None] * ab[:, :1] + ab[:, 1:])
-            rgb = rgb.index_put((mask.nonzero(as_tuple=True)), rgb[mask] + spec)
-        rgba = torch.cat([rgb * mask[..., None], mask[..., None].float()], -1)
-        aa = dr.antialias(rgba[None].contiguous(), rast, clip, faces)[0]
+        return torch.cat([DIFFUSE_MAX * torch.sigmoid(self.diffuse), torch.sigmoid(self.spec[..., :1]),
+                          lo + (hi - lo) * torch.sigmoid(self.spec[..., 1:])], -1).reshape(-1, 5)
+
+    def render(self, cam, light, lut, mvp: torch.Tensor | None = None, track_coverage: bool = False) -> dict:
+        out = render_triangles(self.verts.reshape(-1, 3), self.faces(), self.corner_attributes(), self.face_normals(),
+                               cam, light, lut, mvp)
         if track_coverage:
             with torch.no_grad():
-                cnt = torch.bincount(tri[mask], minlength=self.num).float()
-                self.max_cov = torch.maximum(self.max_cov, cnt)
-        return {"rgb": aa[..., :3], "alpha": aa[..., 3], "mask": mask, "normal": n, "position": pos, "tri": tri}
+                m = out["mask"]
+                self.max_cov = torch.maximum(self.max_cov, torch.bincount(out["tri"][m], minlength=self.num).float())
+        return out
 
     # ------------------------------------------------------------------ priors
     @staticmethod
@@ -189,6 +166,187 @@ class OpaqueSoup:
 
     def state_dict(self) -> dict:
         return {n: getattr(self, n).detach().cpu() for n in self.PARAMS}
+
+
+# ---------------------------------------------------------------------- shared renderer
+def render_triangles(V: torch.Tensor, faces: torch.Tensor, attrs: torch.Tensor, face_normals: torch.Tensor, cam, light,
+                     lut, mvp: torch.Tensor | None = None) -> dict:
+    """Opaque z-buffer render of triangles with per-vertex attrs [N, 5] = (diffuse rgb, F0, roughness)."""
+    dev = V.device
+    mvp = mvp_matrix(cam).to(dev) if mvp is None else mvp
+    clip = (torch.cat([V, torch.ones_like(V[:, :1])], -1) @ mvp.T)[None].contiguous()
+    rast, _ = dr.rasterize(get_context(dev), clip, faces, resolution=[cam.height, cam.width])
+    tri = rast[0, ..., 3].long() - 1
+    mask = tri >= 0
+    interp, _ = dr.interpolate(torch.cat([attrs, V], -1)[None].contiguous(), rast, faces)
+    interp = interp[0]
+    pos = interp[..., 5:8]
+    o = torch.as_tensor(np.asarray(cam.center), dtype=torch.float32, device=dev)
+    n = torch.zeros_like(pos)
+    n[mask] = face_normals[tri[mask]]
+    d = F.normalize(pos - o, dim=-1)
+    n = torch.where(((n * d).sum(-1, keepdim=True) > 0), -n, n)                      # face the camera
+    rgb = interp[..., 0:3]
+    if light is not None and mask.any():
+        dm, nm = d[mask], n[mask]
+        refl = F.normalize(dm - 2 * (dm * nm).sum(-1, keepdim=True) * nm, dim=-1)
+        rho = interp[..., 4][mask]
+        nv = (-(dm * nm).sum(-1)).clamp(1e-4, 1)
+        ab = lookup_lut(lut, nv, rho)
+        spec = light.specular(refl, rho) * (interp[..., 3][mask][:, None] * ab[:, :1] + ab[:, 1:])
+        rgb = rgb.index_put(mask.nonzero(as_tuple=True), rgb[mask] + spec)
+    rgba = torch.cat([rgb * mask[..., None], mask[..., None].float()], -1)
+    aa = dr.antialias(rgba[None].contiguous(), rast, clip, faces)[0]
+    return {"rgb": aa[..., :3], "alpha": aa[..., 3], "mask": mask, "normal": n, "position": pos, "tri": tri}
+
+
+# ---------------------------------------------------------------------- Stage B: weld + RDT + connected mesh
+@torch.no_grad()
+def weld_soup(verts: torch.Tensor, attrs: torch.Tensor, eps: float):
+    """Merge soup corners within ~eps (grid snapping). Returns V [N,3], faces [F',3], attrs [N,C]."""
+    P = verts.reshape(-1, 3)
+    key = torch.floor(P / eps).long()
+    key = key - key.min(0).values
+    span = key.max(0).values + 1
+    lin = (key[:, 0] * span[1] + key[:, 1]) * span[2] + key[:, 2]
+    uniq, inv = torch.unique(lin, return_inverse=True)
+    cnt = torch.zeros(len(uniq), device=P.device).index_add_(0, inv, torch.ones_like(inv, dtype=torch.float))
+    V = torch.zeros(len(uniq), 3, device=P.device).index_add_(0, inv, P) / cnt[:, None]
+    A = torch.zeros(len(uniq), attrs.shape[-1], device=P.device).index_add_(0, inv, attrs.reshape(-1, attrs.shape[-1]))
+    A = A / cnt[:, None]
+    faces = inv.reshape(-1, 3)
+    ok = (faces[:, 0] != faces[:, 1]) & (faces[:, 1] != faces[:, 2]) & (faces[:, 2] != faces[:, 0])
+    faces = faces[ok]
+    return V, faces, A
+
+
+def rdt_remesh(V: torch.Tensor, faces: torch.Tensor, mode: str = "manifold", max_distance_ratio=0.5,
+               min_normal_cos=0.15, min_quality=0.02) -> torch.Tensor:
+    """T²-Splat's surface-filtered restricted Delaunay remesh of a welded soup.
+
+    mode "manifold": score-ordered greedy selection with <= 2 faces per edge and consistent
+    fans/orientation (utils.rdt_surface.select_rdt_surface); "g": up to 4 faces per edge.
+    """
+    from functools import partial
+    import rdel
+    from utils.rdt_surface import run_g_surface_rdt, select_rdt_surface
+    v_np, f_np = V.detach().cpu().numpy(), faces.detach().cpu().numpy().astype(np.int64)
+    kw = dict(max_distance_ratio=max_distance_ratio, min_normal_cos=min_normal_cos, min_quality=min_quality)
+    if mode == "g":
+        out = run_g_surface_rdt(v_np, f_np, rdt_run=rdel.run, **kw)
+    elif mode == "manifold":
+        out = rdel.run(v_np, f_np, verbose=False, orient=False, return_debug=False,
+                       face_selector=partial(select_rdt_surface, **kw))
+    else:
+        raise ValueError(mode)
+    return torch.as_tensor(np.asarray(out, dtype=np.int64), device=V.device)
+
+
+class ConnectedMesh:
+    """Shared-vertex opaque mesh with per-vertex appearance (Stage B refinement)."""
+    PARAMS = ("verts", "diffuse", "spec")
+
+    def __init__(self, V, faces, attrs, lr_pos=5e-5, lr_color=1e-2, lr_spec=1e-2):
+        lo, hi = ROUGH_RANGE
+        self.faces = faces.int().contiguous()
+        self.verts = V.detach().clone().requires_grad_(True)
+        self.diffuse = _logit(attrs[:, :3] / DIFFUSE_MAX).to(V.device).requires_grad_(True)
+        self.spec = torch.stack([_logit(attrs[:, 3]), _logit((attrs[:, 4] - lo) / (hi - lo))], -1).to(V.device)
+        self.spec.requires_grad_(True)
+        self.opt = torch.optim.Adam([{"params": [self.verts], "lr": lr_pos, "name": "verts"},
+                                     {"params": [self.diffuse], "lr": lr_color, "name": "diffuse"},
+                                     {"params": [self.spec], "lr": lr_spec, "name": "spec"}])
+        self._edges()
+        self.max_cov = torch.zeros(self.faces.shape[0], device=V.device)
+
+    def _edges(self):
+        f = self.faces.long()
+        e = torch.cat([f[:, [0, 1]], f[:, [1, 2]], f[:, [2, 0]]], 0)
+        fid = torch.arange(f.shape[0], device=f.device).repeat(3)
+        es = torch.sort(e, 1).values
+        key = es[:, 0] * (self.verts.shape[0] + 1) + es[:, 1]
+        uniq, inv, cnt = torch.unique(key, return_inverse=True, return_counts=True)
+        self.edges = torch.stack([uniq // (self.verts.shape[0] + 1), uniq % (self.verts.shape[0] + 1)], -1)
+        # face pairs across manifold edges
+        order = torch.argsort(inv)
+        inv_s, fid_s = inv[order], fid[order]
+        two = cnt[inv_s] == 2
+        first = torch.ones_like(two)
+        first[1:] = inv_s[1:] != inv_s[:-1]
+        idx = (first & two).nonzero()[:, 0]
+        self.face_pairs = torch.stack([fid_s[idx], fid_s[idx + 1]], -1)
+
+    def face_normals(self):
+        v = self.verts[self.faces.long()]
+        return F.normalize(torch.cross(v[:, 1] - v[:, 0], v[:, 2] - v[:, 0], dim=-1), dim=-1)
+
+    def attributes(self):
+        lo, hi = ROUGH_RANGE
+        return torch.cat([DIFFUSE_MAX * torch.sigmoid(self.diffuse), torch.sigmoid(self.spec[:, :1]),
+                          lo + (hi - lo) * torch.sigmoid(self.spec[:, 1:])], -1)
+
+    def render(self, cam, light, lut, mvp=None, track_coverage=False):
+        out = render_triangles(self.verts, self.faces, self.attributes(), self.face_normals(), cam, light, lut, mvp)
+        if track_coverage:
+            with torch.no_grad():
+                m = out["mask"]
+                self.max_cov = torch.maximum(self.max_cov, torch.bincount(out["tri"][m], minlength=self.faces.shape[0]).float())
+        return out
+
+    def laplacian_loss(self):
+        a, b = self.edges[:, 0], self.edges[:, 1]
+        n = self.verts.shape[0]
+        nb = torch.zeros_like(self.verts).index_add_(0, a, self.verts[b]).index_add_(0, b, self.verts[a])
+        deg = torch.zeros(n, device=self.verts.device).index_add_(0, a, torch.ones_like(a, dtype=torch.float))
+        deg = deg.index_add_(0, b, torch.ones_like(b, dtype=torch.float)).clamp_min(1)
+        return ((nb / deg[:, None] - self.verts) ** 2).sum(-1).mean()
+
+    def normal_consistency_loss(self):
+        if self.face_pairs.numel() == 0:
+            return self.verts.new_zeros(())
+        fn = self.face_normals()
+        return (1 - (fn[self.face_pairs[:, 0]] * fn[self.face_pairs[:, 1]]).sum(-1).abs()).mean()
+
+    @torch.no_grad()
+    def prune_faces(self, remove: torch.Tensor) -> int:
+        if remove.any():
+            self.faces = self.faces[~remove].contiguous()
+            self.max_cov = self.max_cov[~remove]
+            self._edges()
+        return int(remove.sum())
+
+    def step(self):
+        self.opt.step()
+        self.opt.zero_grad(set_to_none=True)
+
+    def set_lr(self, name, lr):
+        for g in self.opt.param_groups:
+            if g["name"] == name:
+                g["lr"] = lr
+
+
+@torch.no_grad()
+def outside_masks(points: torch.Tensor, views, dilate_px: int = 2) -> torch.Tensor:
+    """True for points that project outside the (dilated) object mask in at least one view.
+
+    Visual-hull property: every true surface point lies inside the silhouette in every view.
+    views: iterable of (PinholeCamera, mask [H, W] tensor/array).
+    """
+    out = torch.zeros(points.shape[0], dtype=torch.bool, device=points.device)
+    for cam, mask in views:
+        m = torch.as_tensor(mask, dtype=torch.float32, device=points.device)[None, None]
+        if dilate_px > 0:
+            m = F.max_pool2d(m, 2 * dilate_px + 1, 1, dilate_px)
+        c2w = torch.as_tensor(cam.c2w, dtype=torch.float32, device=points.device)
+        xc = (points - c2w[:3, 3]) @ c2w[:3, :3]
+        z = -xc[:, 2]
+        u = cam.focal * xc[:, 0] / z.clamp_min(1e-6) + 0.5 * cam.width
+        v = -cam.focal * xc[:, 1] / z.clamp_min(1e-6) + 0.5 * cam.height
+        inside = (z > 0) & (u >= 0) & (u < cam.width) & (v >= 0) & (v < cam.height)
+        grid = torch.stack([u / cam.width * 2 - 1, v / cam.height * 2 - 1], -1)[None, None]
+        mv = F.grid_sample(m, grid, align_corners=False)[0, 0, 0]
+        out |= inside & (mv < 0.5)
+    return out
 
 
 # ---------------------------------------------------------------------- initialisation

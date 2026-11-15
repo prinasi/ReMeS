@@ -14,6 +14,7 @@ export), so faces are re-oriented:
 """
 from __future__ import annotations
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 
@@ -135,6 +136,75 @@ def vertex_normals(vertices: torch.Tensor, faces: torch.Tensor) -> torch.Tensor:
 
 
 @torch.no_grad()
+@torch.no_grad()
+def orient_components(mesh: FrozenMesh, cameras, escape_rays: int = 32) -> tuple[FrozenMesh, dict]:
+    """Orient a (mostly) manifold mesh per connected component.
+
+    BFS over faces sharing a manifold edge propagates a consistent winding; each component
+    is then flipped as a whole by its summed camera votes (ray-escape test if unseen).
+    Unlike orient_mesh (independent per-face decisions), this keeps winding consistent.
+    """
+    from collections import deque
+    f = mesh.faces.long().cpu().numpy()
+    nF = len(f)
+    directed = np.concatenate([f[:, [0, 1]], f[:, [1, 2]], f[:, [2, 0]]], 0)
+    fid = np.tile(np.arange(nF), 3)
+    und = np.sort(directed, 1)
+    key = und[:, 0].astype(np.int64) * (int(f.max()) + 1) + und[:, 1]
+    order = np.argsort(key, kind="stable")
+    ks, fs, ds = key[order], fid[order], directed[order]
+    nbrs = [[] for _ in range(nF)]
+    i = 0
+    while i < len(ks):
+        j = i
+        while j + 1 < len(ks) and ks[j + 1] == ks[i]:
+            j += 1
+        if j == i + 1:                                   # manifold edge shared by exactly two faces
+            a, b = fs[i], fs[j]
+            rel = int(ds[i][0] == ds[j][0])              # same direction -> inconsistent winding
+            nbrs[a].append((b, rel))
+            nbrs[b].append((a, rel))
+        i = j + 1
+    rel_flip = np.zeros(nF, dtype=np.int8)
+    comp = np.full(nF, -1, dtype=np.int64)
+    nc = 0
+    for s in range(nF):
+        if comp[s] >= 0:
+            continue
+        comp[s] = nc
+        q = deque([s])
+        while q:
+            u = q.popleft()
+            for v, rel in nbrs[u]:
+                if comp[v] < 0:
+                    comp[v] = nc
+                    rel_flip[v] = rel_flip[u] ^ rel
+                    q.append(v)
+        nc += 1
+    dev = mesh.vertices.device
+    faces = mesh.faces.clone()
+    rf = torch.as_tensor(rel_flip.astype(bool), device=dev)
+    faces[rf] = faces[rf][:, [0, 2, 1]]
+    consistent = FrozenMesh(mesh.vertices, faces)
+    signed, total = camera_votes(consistent, cameras)
+    comp_t = torch.as_tensor(comp, device=dev)
+    csum = torch.zeros(nc, device=dev).index_add_(0, comp_t, signed)
+    ctot = torch.zeros(nc, device=dev).index_add_(0, comp_t, total)
+    decision = torch.sign(csum)
+    unseen = (ctot == 0) | (decision == 0)
+    if unseen.any():
+        ext = (mesh.vertices.max(0).values - mesh.vertices.min(0).values).norm().item()
+        tracer = MeshTracer(mesh.vertices, faces)
+        face_unseen = unseen[comp_t]
+        d_face = escape_side(consistent, tracer, face_unseen.nonzero()[:, 0], k=escape_rays, eps=1e-5 * ext)
+        votes = torch.zeros(nc, device=dev).index_add_(0, comp_t[face_unseen], d_face.float())
+        decision[unseen] = torch.where(votes[unseen] >= 0, 1.0, -1.0)
+    flip = decision[comp_t] < 0
+    faces[flip] = faces[flip][:, [0, 2, 1]]
+    stats = {"faces": nF, "components": nc, "flipped": int((rf ^ flip).sum()), "unseen_components": int(unseen.sum())}
+    return FrozenMesh(mesh.vertices, faces, None, mesh.source), stats
+
+
 def orient_mesh(mesh: FrozenMesh, cameras, escape_rays: int = 32) -> tuple[FrozenMesh, dict]:
     signed, total = camera_votes(mesh, cameras)
     seen = total > 0

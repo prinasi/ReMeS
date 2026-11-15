@@ -71,3 +71,31 @@ class OrientTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class OrientComponentsTest(unittest.TestCase):
+    @unittest.skipUnless(torch.cuda.is_available(), "GPU not available")
+    def test_random_flips_become_consistent_outward(self):
+        import trimesh
+        from relight.camera import PinholeCamera
+        from relight.mesh import FrozenMesh
+        from relight.orient import orient_components
+        s = trimesh.creation.icosphere(subdivisions=3, radius=0.5)
+        V = torch.tensor(s.vertices, dtype=torch.float32, device="cuda")
+        Fc = torch.tensor(s.faces, dtype=torch.int64, device="cuda")
+        g = torch.Generator(device="cuda").manual_seed(0)
+        flip = torch.rand(Fc.shape[0], device="cuda", generator=g) > 0.5
+        Fc[flip] = Fc[flip][:, [0, 2, 1]]
+        cams = []
+        for az in np.linspace(0, 2 * np.pi, 6, endpoint=False):
+            c = np.array([3 * np.cos(az), 3 * np.sin(az), 1.0])
+            z = c / np.linalg.norm(c)                       # camera looks along -z towards the origin
+            x = np.cross([0, 0, 1.0], z); x /= np.linalg.norm(x)
+            y = np.cross(z, x)
+            c2w = np.eye(4); c2w[:3, 0], c2w[:3, 1], c2w[:3, 2], c2w[:3, 3] = x, y, z, c
+            cams.append(PinholeCamera(c2w, 0.8, 128, 128))
+        out, stats = orient_components(FrozenMesh(V, Fc.int()), cams)
+        v = out.vertices[out.faces.long()]
+        n = torch.cross(v[:, 1] - v[:, 0], v[:, 2] - v[:, 0], dim=-1)
+        self.assertEqual(stats["components"], 1)
+        self.assertTrue(bool(((n * v.mean(1)).sum(-1) > 0).all()))

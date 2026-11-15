@@ -402,9 +402,49 @@ Conclusions
    specular reflection (and ties it to the normal), and (b) single-surface output (anti-layering
    regularisation during training and/or silhouette-preserving surface extraction).
 
+## Geometry fix: opaque triangle soup → connected mesh (2026-11-15/16)
+Experiments on SynthGeo (GT geometry), glossy Suzanne unless noted; distances in % of the object diagonal.
+
+**(a) Deferred specular inside T²-Splat** (`relight/deferred.py`, `--deferred_spec`): SH capped, reflection-
+direction specular from rendered normals. Glossy normal error 20.3° → 12–15° (v1 14.1°, split-sum E1 14.7°,
++normal consistency E2 12.1°, linear + learned light E4 13.8°, **oracle GT light E3 12.2°**), layering unchanged
+(82–89%). Even a perfect light cannot fix it: in T²-Splat's soup stage normals are blends of stacked sheets.
+
+**RDT analysis** (`scripts/analyze_rdt.py`, snapshots): layering forms in the soft soup stage (90–94% by 6k, before
+RDT); RDT then doubles bad triangles (diffuse 36→71%, normal error 21→44°) — wrong connectivity, repaired only
+partly by 30k (diffuse 20% bad, glossy 55%). On glossy, 54% of vertices are already off-surface before RDT.
+Compressing T²-Splat's soft→opaque schedule so RDT sees an opaque soup does **not** help (diffuse 5.0→11°,
+layering 86–91%), with or without the specular branch.
+
+**Stage A — OTO-style opaque soup** (`relight/oto.py`, `scripts/train_oto.py`; idea from Yan et al., "1000FPS+ NVS
+from End-to-End Opaque Triangle Optimization"): disjoint triangles opaque from the first iteration, nvdiffrast
+z-buffer forward, gradients via interpolation, face normals and `dr.antialias` (in place of OTO's 2D-SDF /
+two-layer approximations); appearance = per-corner diffuse + reflection-direction split-sum specular with a
+learnable HDR env (view dependence only through the triangle normal — OTO's per-triangle SH lets triangles fake
+reflections, its stated limitation); mask loss, normal–depth consistency, coverage-based prune (never wins the
+z-test → hidden sheets removed) / split; visual-hull init. 15k iterations, ~25 min.
+
+**Stage B — connectivity + refinement**: screened Poisson (depth 9) on the outward-oriented soup, quadric
+decimation to 200k faces, attributes from the nearest soup point, connected refinement (image, mask,
+normal–depth, Laplacian, adjacent-normal consistency), per-component orientation (`relight/orient.py:
+orient_components`). Alternative `--remesh rdt` (weld + T²-Splat manifold RDT) leaves ~26% boundary edges.
+
+| Glossy Suzanne | Normal err (face, med) | Screen normal MAE | Acc. median | Layering | Boundary edges |
+|---|---|---|---|---|---|
+| T²-Splat | 20.3° | 20.4° | 0.157 | 86% | 66% |
+| Stage A soup | 5.3° | 5.7° | 0.048 | 14% | — |
+| Stage B, RDT (manifold) | 5.7° | 7.8° | 0.058 | 3% | 26% |
+| Stage B, Poisson | 5.3° | 5.3° | 0.073 | 0.3% | 0.9% |
+
+All materials (Stage B RDT, `output/oto/v2`): diffuse 3.5° / textured 3.6° / glossy 5.7° face-normal error vs
+T²-Splat 5.0° / 7.0° / 20.3°; non-manifold edges 0, winding-inconsistent 0 (T²-Splat 5–6% / 33–38%).
+
+Open issues: (1) textureless-plane ambiguity — the uniform slab's top bulges ~0.08 above GT (T²-Splat ~0.044),
+inherited from the visual-hull roof; free per-corner colour can bake shading/shadows, so nothing constrains it
+(shadow-aware shading or depth priors would) — this dominates mean accuracy (0.43–0.59); (2) concavities the hull
+cannot carve need insertion / longer optimisation.
+
 ## 6. Immediate next steps
-1. Geometry (prerequisite for Phase 4): (a) view-dependent appearance model in the T²-Splat stage
-   (options: diffuse + reflection-direction specular, PBR split-sum with learnable light, MLP);
-   (b) single-surface output (anti-layering regulariser and/or silhouette-preserving extraction).
-   Evaluate on SynthGeo (GT geometry: glossy must approach diffuse) and downstream on Synthetic4Relight.
-2. Then Phase 4 (indirect), on the improved geometry.
+1. Real scenes with the new geometry (Stage A+B) → Phase 2 / 5 metrics vs the T²-Splat-based pipeline.
+2. Textureless ambiguity: shadow/visibility-aware appearance in the geometry stage, or depth priors.
+3. Then Phase 4 (indirect light) on the improved geometry.
