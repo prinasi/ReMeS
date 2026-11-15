@@ -251,7 +251,49 @@ Findings
   smoothed shading normals and/or learned per-face normal offsets; air_baloons strings (1–2 px)
   are not reconstructed.
 
+## Phase 2 status (v1 done 2026-11-15)
+Code: `relight/shading.py` (binned env diffuse + split-sum specular + specular occlusion),
+`relight/visibility.py` (per-vertex packed visibility), `relight/material.py` (per-vertex PBR),
+`scripts/train_pbr.py`, driver `scripts/phase2_all.sh`, table `scripts/summarize_pbr.py`.
+Tests: `tests/test_shading.py` (white furnace, prefilter, LUT, irradiance vs Phase 0 reference,
+mirror specular, visibility).
+
+Design changes vs the plan above (v1, deliberately simple):
+- **Per-vertex materials** instead of per-face R×R textures: faces cover ~2.5 px, ~45% of faces are
+  not hit by 10 training views; per-face residual textures exist but are off (`--face-res 0`).
+  The per-face sampling equivalence test moves to Phase 5 (exporter compatibility).
+- Data-driven albedo init (Σ L_obs / Σ E_vis/π per vertex); constant 0.5 stalls at ~14 dB.
+- Loss: L1 on `x^(1/2.2)` of linear HDR over random pixel batches (2^17), no D-SSIM.
+- Shadow rays start `10 ×` median edge length off the surface (`--vis-tmin`): the bumpy T²-Splat
+  surface self-occludes otherwise (occluded share falls 37%→21% on jugs from 0→10 h); albedo
+  +2.9 dB, NVS/relight unchanged (jugs sweep 2/5/10 h).
+- Metallic frozen at 0 (Synthetic4Relight is dielectric). 3000 iterations, ~5 min/scene.
+
+Oracle light (envmap3), 50 test views, PSNR inside the GT mask unless noted:
+
+| Run | NVS | Albedo aligned / raw | Rough MSE | Relight env6 | Relight env12 | NVS full img | Relight env12 full img |
+|---|---|---|---|---|---|---|---|
+| with visibility (mean) | 26.25 | 22.17 / 21.14 | 0.074 | 25.60 | 25.68 | 32.85 | 32.33 |
+| no visibility (mean) | 26.70 | 21.10 / 21.09 | 0.100 | 25.16 | 24.43 | 33.23 | 31.12 |
+
+Per scene (with visibility): air_baloons 24.74 / 18.80 / 0.111 / 23.97 / 24.66, chair 26.94 / 23.51 /
+0.027 / 25.81 / 26.60, hotdog 23.98 / 20.79 / 0.113 / 22.71 / 22.13, jugs 29.35 / 25.57 / 0.047 / 29.89 /
+29.34 (NVS / albedo aligned / rough MSE / env6 / env12).
+
+Findings
+- Visibility trades a little training-light fit (NVS −0.45 dB: without it shadows are baked into
+  albedo) for better relighting (env12 +1.25 dB, env6 +0.44 dB), albedo (+1.07 dB) and roughness
+  (MSE 0.100→0.074) — the expected signature of separating cast shadows from albedo (claim A2).
+- Albedo is too bright in occluded regions (aligned scales 0.47–0.94 < 1; jugs worst): the GT has
+  interreflections, our model none → Phase 4 one-bounce indirect.
+- Glossy flat surfaces (hotdog plate) are dominated by faceted T²-Splat normals: specular streaks and
+  roughness driven up (hotdog / air_baloons rough MSE ≈ 0.11). Fix belongs to the geometry stage.
+- Gap to T²-Splat's own appearance (full-image NVS 36.5–42.5 dB) is 5–7 dB: physically based shading
+  cannot absorb geometry errors the way SH + face textures can.
+
 ## 6. Immediate next steps
-1. Phase 2: per-face PBR textures + nvdiffrast sampling equivalence test vs the T²-Splat CUDA render.
-2. Shading normals: spatially smoothed vertex normals (radius-based, orientation-aware) on `relight_mesh.pt`.
-3. Per-vertex visibility precompute (cubvh, 512 dirs) and oracle-light (envmap3) material optimization.
+1. Phase 3: learnable HDR envmap (log space) + white-balance prior; compare against the Phase 2 oracle.
+2. Phase 5 early (whole pipeline first): PBR GLB export (vertex attributes → per-face tiles) and
+   Blender Cycles relighting under envmap6/12 — engine-relight PSNR.
+3. Phase 4: one-bounce indirect from textured hits (addresses albedo over-brightening).
+4. Later: geometry quality (smooth normals / normal refinement), per-face residual textures.
