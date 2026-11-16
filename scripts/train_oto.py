@@ -68,13 +68,17 @@ def stage_b(a, soup, views, light, lut, light_opt, log, t0, mapper=None):
     print(f"[stage B] {a.remesh}: {soup.verts.shape[0] * 3:,} soup corners -> {cm.faces.shape[0]:,} faces on "
           f"{cm.verts.shape[0]:,} vertices ({time.perf_counter() - t0:.0f}s)", flush=True)
     for it in range(1, a.stage_b_iters + 1):
+        if a.remesh_every > 0 and it > 1 and (it - 1) % a.remesh_every == 0 and it <= a.stage_b_iters - a.remesh_every:
+            info = cm.remesh(a.remesh_scale)
+            print(f"[B {it - 1:5d}] remesh: target edge {info['target_len']:.4f}, V/F {info['before']} -> "
+                  f"{info['after']}", flush=True)
         cm.set_lr("verts", a.lr_pos_b * 0.1 ** (it / a.stage_b_iters))
         cam, m, gt, mvp = random.choice(views)
         if light is not None:
             light.refresh()
         shadow = shadow_context(mapper, light, cm.verts, cm.faces, a.shadow_dirs) \
             if (soup.is_albedo and mapper is not None and light is not None) else None
-        o = cm.render(cam, light, lut, mvp=mvp, shadow=shadow)
+        o = cm.render(cam, light, lut, mvp=mvp, shadow=shadow, soft_edge_tau=a.soft_edge_tau)
         l_img = (gamma(o["rgb"]) - gt).abs().mean()
         loss = l_img + a.lambda_mask * (o["alpha"] - m).abs().mean() + a.lambda_dn * cm_dn(o) \
             + a.lambda_lap * cm.laplacian_loss() + a.lambda_nc * cm.normal_consistency_loss()
@@ -187,6 +191,11 @@ def main():
                    help="light bins (Fibonacci) for diffuse irradiance; all are shadow-mapped every iteration")
     p.add_argument("--shadow-res", type=int, default=512)
     p.add_argument("--lambda-albedo", type=float, default=0.02, help="edge-aware albedo smoothness (physical mode)")
+    p.add_argument("--remesh-every", type=int, default=0,
+                   help="Stage B: isotropic remeshing (split/collapse/flip/relax) every N iterations (0 = off)")
+    p.add_argument("--remesh-scale", type=float, default=1.0, help="target edge length / current median edge")
+    p.add_argument("--soft-edge-tau", type=float, default=0.0,
+                   help="OTO two-layer/2D-SDF edge gradient with sigmoid temperature tau (1/px); 0 = antialias only")
     p.add_argument("--max-tris-pbr", type=int, default=450_000,
                    help="triangle cap once physical shading is on (batched shadow maps scale with triangle count)")
     p.add_argument("--dn-from", type=int, default=1000)
@@ -267,7 +276,7 @@ def main():
                   flush=True)
         shadow = shadow_context(mapper, light, soup.verts.reshape(-1, 3), soup.faces(), a.shadow_dirs) \
             if soup.is_albedo else None
-        o = soup.render(cam, light, lut, mvp=mvp, track_coverage=True, shadow=shadow)
+        o = soup.render(cam, light, lut, mvp=mvp, track_coverage=True, shadow=shadow, soft_edge_tau=a.soft_edge_tau)
         l_img = (gamma(o["rgb"]) - gt).abs().mean()
         l_mask = (o["alpha"] - m).abs().mean()
         loss = l_img + a.lambda_mask * l_mask

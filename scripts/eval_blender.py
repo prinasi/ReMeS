@@ -72,8 +72,13 @@ def main():
         v = mat.vertex_values()
         albedo = (v["albedo"] * torch.tensor(scale, device="cuda")).clamp(0, 1)
     glb = run / ("asset_aligned.glb" if not a.no_align else "asset.glb")
+    face_tiles = None
+    if mat.residual is not None:                                  # per-face residual textures -> exact tiles
+        face_tiles = mat.face_texel_values(4)
+        face_tiles["albedo"] = np.clip(face_tiles["albedo"] * np.asarray(scale, np.float32), 0, 1)
     rep = write_pbr_glb(mesh.vertices.cpu().numpy(), mesh.faces.cpu().numpy(), mesh.vertex_normals.cpu().numpy(),
-                        albedo.cpu().numpy(), v["rough"].cpu().numpy(), v["metal"].cpu().numpy(), glb)
+                        albedo.cpu().numpy(), v["rough"].cpu().numpy(), v["metal"].cpu().numpy(), glb,
+                        tile_size=4, face_tiles=face_tiles)
     print(f"[export] {rep['faces']:,} faces, {rep['pages']} page(s), {rep['bytes'] / 1e6:.1f} MB, albedo scale {scale}")
 
     args = torch.load(run / "material.pt", map_location="cpu", weights_only=False)["args"]

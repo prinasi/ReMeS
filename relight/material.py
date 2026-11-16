@@ -10,6 +10,7 @@ Optional: per-face residual logits [F,R,R,C] in T²-Splat's barycentric texel la
 """
 from __future__ import annotations
 
+import numpy as np
 import torch
 import torch.nn as nn
 
@@ -87,6 +88,26 @@ class PBRMaterial(nn.Module):
         t00, t01 = tex[ar, y0, x0], tex[ar, y0, x0 + 1]
         t10, t11 = tex[ar, y0 + 1, x0], tex[ar, y0 + 1, x0 + 1]
         return (1 - fy) * ((1 - fx) * t00 + fx * t01) + fy * ((1 - fx) * t10 + fx * t11)
+
+    @torch.no_grad()
+    def face_texel_values(self, T: int, chunk: int = 65536) -> dict:
+        """Final per-face texel values [F, T, T, ·] in the export tile layout (utils/glb_export.bake_tiles):
+        texel (row, col) at w1 = col/(T-1), w2 = row/(T-1); texels outside the triangle (row+col > T-1)
+        are reflected across the hypotenuse. Includes per-face residual textures if present."""
+        v, u = np.mgrid[:T, :T].astype(np.float32) / (T - 1)
+        outside = u + v > 1
+        b, c = np.where(outside, 1 - v, u), np.where(outside, 1 - u, v)
+        bary = torch.as_tensor(np.stack((1 - b - c, b, c), -1).reshape(-1, 3), device=self.faces.device)  # [T*T, 3]
+        F_ = self.faces.shape[0]
+        out = {"albedo": torch.empty(F_, T, T, 3), "rough": torch.empty(F_, T, T), "metal": torch.empty(F_, T, T)}
+        for s in range(0, F_, chunk):
+            fid = torch.arange(s, min(s + chunk, F_), device=self.faces.device)
+            n = fid.shape[0]
+            vals = self.sample(fid.repeat_interleave(T * T), bary.repeat(n, 1))
+            out["albedo"][s:s + n] = vals["albedo"].reshape(n, T, T, 3).cpu()
+            out["rough"][s:s + n] = vals["rough"].reshape(n, T, T).cpu()
+            out["metal"][s:s + n] = vals["metal"].reshape(n, T, T).cpu()
+        return {k: v.numpy() for k, v in out.items()}
 
     # ------------------------------------------------------------------ regularisers
     def edge_smoothness(self, edges: torch.Tensor, weights=(1.0, 1.0)) -> torch.Tensor:

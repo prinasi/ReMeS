@@ -485,6 +485,14 @@ Real scenes (v5, means over 4): materials/relighting ≈ v4 (albedo 23.21 vs 23.
 Normal deviation 1.0–4.8°, layering 0–3%. Contact-region remnants under undercuts (jug bellies) persist: never
 directly observed, mask-uncarvable, and both remnant and true surface are in shadow.
 
+### Follow-ups: soft edges, remeshing, per-face textures (2026-11-16) — all off by default
+- `--soft-edge-tau` (OTO two-layer + 2D-SDF edge gradient via `dr.DepthPeeler`, forward unchanged): glossy Suzanne
+  face-normal error 2.8° → 3.9° (τ=1) / 5.8° (τ=2), median accuracy 0.034 → 0.081 / 0.165 — worse; antialias-only kept.
+- `--remesh-every 1000` (pymeshlab isotropic remeshing in Stage B, GPL-3 dependency): neutral (2.7° vs 2.8°,
+  accuracy 0.033 vs 0.034); does not fix undercuts.
+- `train_pbr.py --face-res 4` + exact per-face tile export (`PBRMaterial.face_texel_values`): jugs −0.2–0.4 dB vs
+  per-vertex (faces cover ~2.5 px, so per-vertex already resolves the image).
+
 ## 6. Immediate next steps
 1. Undercut / contact-region geometry: better initialisation than the visual hull (e.g. depth-fused surface from
    the opaque soup itself, or inward pressure on regions only observed at grazing angles).

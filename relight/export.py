@@ -36,9 +36,13 @@ def _zup_to_yup(x: np.ndarray) -> np.ndarray:
 def write_pbr_glb(vertices: np.ndarray, faces: np.ndarray, normals: np.ndarray, albedo: np.ndarray,
                   rough: np.ndarray, metal: np.ndarray, out: str | Path, tile_size: int = 4,
                   padding: int = 1, atlas_size: int = 4096, double_sided: bool = True,
-                  chunk_faces: int = 65536) -> dict:
+                  chunk_faces: int = 65536, face_tiles: dict | None = None) -> dict:
     """vertices/normals [V,3] (Blender Z-up world), faces [F,3], albedo [V,3] linear,
-    rough/metal [V]. Returns an export report."""
+    rough/metal [V]. Returns an export report.
+
+    face_tiles (optional): per-face texel values in the same tile layout, overriding the per-vertex bake:
+    {"albedo": [F, T, T, 3] linear, "rough": [F, T, T], "metal": [F, T, T]} with T == tile_size
+    (e.g. PBRMaterial.face_texel_values for materials with per-face residual textures)."""
     out = Path(out)
     out.parent.mkdir(parents=True, exist_ok=True)
     faces = np.asarray(faces, dtype=np.int64)
@@ -87,8 +91,16 @@ def write_pbr_glb(vertices: np.ndarray, faces: np.ndarray, normals: np.ndarray, 
         for s in range(first, last, chunk_faces):
             e = min(s + chunk_faces, last)
             f = faces[s:e]
-            for atlas, vals in zip(atlases, (base_v, orm_v)):
-                tiles, _ = bake_tiles(vals[f], None, tile_size)
+            if face_tiles is not None:
+                alb = np.clip(linear_to_srgb(np.asarray(face_tiles["albedo"][s:e], np.float32)), 0, 1)
+                r_, m_ = np.asarray(face_tiles["rough"][s:e]), np.asarray(face_tiles["metal"][s:e])
+                orm = np.stack([np.ones_like(r_), r_, m_], -1)
+                quant = [np.floor(np.clip(t, 0, 1) * 255 + .5).astype(np.uint8) for t in (alb, orm)]
+            for k, (atlas, vals) in enumerate(zip(atlases, (base_v, orm_v))):
+                if face_tiles is not None:
+                    tiles = quant[k]
+                else:
+                    tiles, _ = bake_tiles(vals[f], None, tile_size)
                 tiles = np.pad(tiles, ((0, 0), (padding, padding), (padding, padding), (0, 0)), mode="edge")
                 _place_tiles(atlas, tiles, s - first, grid, cell)
         f = faces[first:last]

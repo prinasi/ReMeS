@@ -70,5 +70,40 @@ class ExportTest(unittest.TestCase):
         self.assertEqual(face0, len(Fc))
 
 
+
+class FaceTextureExportTest(unittest.TestCase):
+    @unittest.skipUnless(__import__("torch").cuda.is_available(), "GPU not available")
+    def test_residual_texels_round_trip(self):
+        import torch
+        from relight.export import write_pbr_glb
+        from relight.io import linear_to_srgb
+        from relight.material import PBRMaterial
+        rng = np.random.default_rng(1)
+        V = rng.normal(size=(30, 3)).astype(np.float32)
+        Fc = rng.integers(0, 30, size=(40, 3))
+        mat = PBRMaterial(torch.tensor(Fc, device="cuda"), 30, face_res=4).cuda()
+        with torch.no_grad():
+            mat.residual.normal_(0, 0.5)
+            mat.albedo.normal_(0, 0.5)
+        tiles = mat.face_texel_values(4)
+        # texel centres reproduce PBRMaterial.sample at the same barycentrics (corner v1 -> col 3)
+        s = mat.sample(torch.arange(40, device="cuda"), torch.tensor([[0.0, 1.0, 0.0]], device="cuda").repeat(40, 1))
+        np.testing.assert_allclose(tiles["albedo"][:, 0, 3], s["albedo"].detach().cpu().numpy(), atol=1e-5)
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "t.glb"
+            vv = mat.vertex_values()
+            write_pbr_glb(V, Fc, V, vv["albedo"].detach().cpu().numpy(), vv["rough"].detach().cpu().numpy(),
+                          vv["metal"].detach().cpu().numpy(), path, tile_size=4, atlas_size=64, face_tiles=tiles)
+            gltf, blob = read_glb(path)
+        prim = gltf["meshes"][0]["primitives"][0]
+        uv = accessor(gltf, blob, prim["attributes"]["TEXCOORD_0"])
+        base = image(gltf, blob, gltf["materials"][0]["pbrMetallicRoughness"]["baseColorTexture"]["index"]) / 255.0
+        nf = len(uv) // 3
+        px = np.floor(uv * base.shape[0]).astype(int).reshape(nf, 3, 2)
+        got = base[px[:, 1, 1], px[:, 1, 0]]                       # corner v1 of each face
+        want = np.clip(linear_to_srgb(tiles["albedo"][:nf, 0, 3]), 0, 1)
+        np.testing.assert_allclose(got, want, atol=1 / 255 + 1e-6)
+
+
 if __name__ == "__main__":
     unittest.main()

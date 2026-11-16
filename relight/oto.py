@@ -75,9 +75,9 @@ class OpaqueSoup:
                           lo + (hi - lo) * torch.sigmoid(self.spec[..., 1:])], -1).reshape(-1, 5)
 
     def render(self, cam, light, lut, mvp: torch.Tensor | None = None, track_coverage: bool = False,
-               shadow: dict | None = None) -> dict:
+               shadow: dict | None = None, soft_edge_tau: float = 0.0) -> dict:
         out = render_triangles(self.verts.reshape(-1, 3), self.faces(), self.corner_attributes(), self.face_normals(),
-                               cam, light, lut, mvp, shadow)
+                               cam, light, lut, mvp, shadow, soft_edge_tau)
         if track_coverage:
             with torch.no_grad():
                 m = out["mask"]
@@ -194,26 +194,13 @@ class OpaqueSoup:
 
 
 # ---------------------------------------------------------------------- shared renderer
-def render_triangles(V: torch.Tensor, faces: torch.Tensor, attrs: torch.Tensor, face_normals: torch.Tensor, cam, light,
-                     lut, mvp: torch.Tensor | None = None, shadow: dict | None = None) -> dict:
-    """Opaque z-buffer render of triangles with per-vertex attrs [N, 5] = (diffuse, F0, roughness).
-
-    shadow=None: the diffuse attribute is outgoing radiance (free appearance).
-    shadow={"mapper", "maps", "idx", "prob"}: the diffuse attribute is albedo, shaded physically as
-        albedo/π · E · (1 - F0·A - B),  E = Σ_k L_k V_k max(n·w_k, 0) / (K p_k)
-    with differentiable shadow-map visibility V (relight/shadowmap.py) over K importance-sampled
-    light bins of ``light`` — cast shadows must then be explained by geometry.
-    """
-    dev = V.device
-    mvp = mvp_matrix(cam).to(dev) if mvp is None else mvp
-    clip = (torch.cat([V, torch.ones_like(V[:, :1])], -1) @ mvp.T)[None].contiguous()
-    rast, _ = dr.rasterize(get_context(dev), clip, faces, resolution=[cam.height, cam.width])
+def _shade_layer(rast, V, faces, attrs, face_normals, o, light, lut, shadow):
+    """Shade one rasterised layer. Returns (rgb [H,W,3] masked, mask, n, pos, tri, interp)."""
     tri = rast[0, ..., 3].long() - 1
     mask = tri >= 0
     interp, _ = dr.interpolate(torch.cat([attrs, V], -1)[None].contiguous(), rast, faces)
     interp = interp[0]
     pos = interp[..., 5:8]
-    o = torch.as_tensor(np.asarray(cam.center), dtype=torch.float32, device=dev)
     n = torch.zeros_like(pos)
     n[mask] = face_normals[tri[mask]]
     d = F.normalize(pos - o, dim=-1)
@@ -236,9 +223,65 @@ def render_triangles(V: torch.Tensor, faces: torch.Tensor, attrs: torch.Tensor, 
             irr = (vis * cos) @ wl                                                        # [N, 3]
             base = base / math.pi * irr * (1 - spec_albedo).clamp_min(0)
         rgb = rgb.index_put(mask.nonzero(as_tuple=True), base + spec)
-    rgba = torch.cat([rgb * mask[..., None], mask[..., None].float()], -1)
+    return rgb * mask[..., None], mask, n, pos, tri, interp
+
+
+def edge_alpha(clip: torch.Tensor, faces: torch.Tensor, tri: torch.Tensor, mask: torch.Tensor, tau: float):
+    """OTO 2D-SDF coverage α = σ(τ · d_in), d_in = pixel distance (px) to the nearest edge of its own front
+    triangle, positive inside. Differentiable w.r.t. the projected vertices."""
+    H, W = mask.shape
+    c = clip[0]
+    xy = torch.stack([(c[:, 0] / c[:, 3] * 0.5 + 0.5) * W, (c[:, 1] / c[:, 3] * 0.5 + 0.5) * H], -1)
+    j, i = mask.nonzero(as_tuple=True)
+    p = torch.stack([i.float() + 0.5, j.float() + 0.5], -1)
+    t = xy[faces[tri[mask]].long()]                                                   # [M, 3, 2]
+    a, b, cc = t[:, 0], t[:, 1], t[:, 2]
+
+    def cross(u, v):
+        return u[:, 0] * v[:, 1] - u[:, 1] * v[:, 0]
+
+    orient = torch.sign(cross(b - a, cc - a)).detach()
+    d = [orient * cross(e1 - e0, p - e0) / (e1 - e0).norm(dim=-1).clamp_min(1e-6)
+         for e0, e1 in ((a, b), (b, cc), (cc, a))]
+    d_in = torch.stack(d, -1).min(-1).values
+    return torch.zeros(H, W, device=clip.device).index_put((j, i), torch.sigmoid(tau * d_in))
+
+
+def render_triangles(V: torch.Tensor, faces: torch.Tensor, attrs: torch.Tensor, face_normals: torch.Tensor, cam, light,
+                     lut, mvp: torch.Tensor | None = None, shadow: dict | None = None,
+                     soft_edge_tau: float = 0.0) -> dict:
+    """Opaque z-buffer render of triangles with per-vertex attrs [N, 5] = (diffuse, F0, roughness).
+
+    shadow=None: the diffuse attribute is outgoing radiance (free appearance).
+    shadow={"mapper", "maps", "idx", "prob"}: the diffuse attribute is albedo, shaded physically as
+        albedo/π · E · (1 - F0·A - B),  E = Σ_k L_k V_k max(n·w_k, 0) / (K p_k)
+    with differentiable shadow-map visibility V (relight/shadowmap.py) over K importance-sampled
+    light bins of ``light`` — cast shadows must then be explained by geometry.
+
+    soft_edge_tau > 0: OTO two-layer + 2D-SDF gradient, forward unchanged. The second depth layer is peeled
+    and shaded (C2); image = C1_aa + (α1 - sg(α1)) · (C1 - C2), α1 = σ(τ·d_in): pixels within ~1/τ px inside
+    an edge move it depending on whether the front or the behind colour fits the image better.
+    """
+    dev = V.device
+    mvp = mvp_matrix(cam).to(dev) if mvp is None else mvp
+    clip = (torch.cat([V, torch.ones_like(V[:, :1])], -1) @ mvp.T)[None].contiguous()
+    o = torch.as_tensor(np.asarray(cam.center), dtype=torch.float32, device=dev)
+    res = [cam.height, cam.width]
+    if soft_edge_tau > 0:
+        with dr.DepthPeeler(get_context(dev), clip, faces, res) as peeler:
+            rast, _ = peeler.rasterize_next_layer()
+            rast2, _ = peeler.rasterize_next_layer()
+    else:
+        rast, _ = dr.rasterize(get_context(dev), clip, faces, resolution=res)
+    rgb, mask, n, pos, tri, interp = _shade_layer(rast, V, faces, attrs, face_normals, o, light, lut, shadow)
+    rgba = torch.cat([rgb, mask[..., None].float()], -1)
     aa = dr.antialias(rgba[None].contiguous(), rast, clip, faces)[0]
-    return {"rgb": aa[..., :3], "alpha": aa[..., 3], "mask": mask, "normal": n, "position": pos, "tri": tri,
+    out_rgb = aa[..., :3]
+    if soft_edge_tau > 0 and mask.any():
+        rgb2 = _shade_layer(rast2, V, faces, attrs, face_normals, o, light, lut, shadow)[0]
+        a1 = edge_alpha(clip, faces, tri, mask, soft_edge_tau)
+        out_rgb = out_rgb + ((a1 - a1.detach()) * mask)[..., None] * (rgb - rgb2.detach())
+    return {"rgb": out_rgb, "alpha": aa[..., 3], "mask": mask, "normal": n, "position": pos, "tri": tri,
             "albedo": interp[..., 0:3]}
 
 
@@ -342,9 +385,9 @@ class ConnectedMesh:
         return torch.cat([DIFFUSE_MAX * torch.sigmoid(self.diffuse), torch.sigmoid(self.spec[:, :1]),
                           lo + (hi - lo) * torch.sigmoid(self.spec[:, 1:])], -1)
 
-    def render(self, cam, light, lut, mvp=None, track_coverage=False, shadow=None):
+    def render(self, cam, light, lut, mvp=None, track_coverage=False, shadow=None, soft_edge_tau=0.0):
         out = render_triangles(self.verts, self.faces, self.attributes(), self.face_normals(), cam, light, lut, mvp,
-                               shadow)
+                               shadow, soft_edge_tau)
         if track_coverage:
             with torch.no_grad():
                 m = out["mask"]
@@ -364,6 +407,29 @@ class ConnectedMesh:
             return self.verts.new_zeros(())
         fn = self.face_normals()
         return (1 - (fn[self.face_pairs[:, 0]] * fn[self.face_pairs[:, 1]]).sum(-1).abs()).mean()
+
+    @torch.no_grad()
+    def remesh(self, scale: float = 1.0, iterations: int = 3) -> dict:
+        """Isotropic remeshing to `scale` × the current median edge length (relight/remesh.py); attributes
+        transferred from the old surface; optimizer state is reset (learning rates kept)."""
+        from relight.remesh import isotropic_remesh, transfer_attributes
+        V, F_ = self.verts.detach(), self.faces.long()
+        v = V[F_]
+        target = scale * float((v - v.roll(1, dims=1)).norm(dim=-1).median())
+        Vn, Fn = isotropic_remesh(V.cpu().numpy(), F_.cpu().numpy(), target, iterations)
+        Vn = torch.as_tensor(Vn, device=V.device)
+        Fn = torch.as_tensor(Fn, device=V.device)
+        A = transfer_attributes(V, self.faces, torch.cat([self.diffuse, self.spec], -1).detach(), Vn)
+        before = (V.shape[0], F_.shape[0])
+        lrs = {g["name"]: g["lr"] for g in self.opt.param_groups}
+        self.faces = Fn.int().contiguous()
+        self.verts = Vn.clone().requires_grad_(True)
+        self.diffuse = A[:, :3].clone().requires_grad_(True)
+        self.spec = A[:, 3:].clone().requires_grad_(True)
+        self.opt = torch.optim.Adam([{"params": [getattr(self, n)], "lr": lrs[n], "name": n} for n in self.PARAMS])
+        self._edges()
+        self.max_cov = torch.zeros(self.faces.shape[0], device=V.device)
+        return {"target_len": target, "before": before, "after": (Vn.shape[0], Fn.shape[0])}
 
     @torch.no_grad()
     def prune_faces(self, remove: torch.Tensor) -> int:
