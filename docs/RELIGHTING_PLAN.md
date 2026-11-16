@@ -499,3 +499,34 @@ directly observed, mask-uncarvable, and both remnant and true surface are in sha
 2. Phase 4 indirect light (also a compensation source at contacts) and Phase 3 learned light on the new geometry;
    make `oto_real.sh` the default geometry stage of `relight_all.sh`.
 3. Textureless-plane depth (slab bulge): depth/planarity prior.
+
+### Better starting shape than the visual hull (v6, commit c24314a + this)
+
+`train_oto.py --init mesh:<dir>` seeds the soup on the Poisson surface of a given mesh (carved by the
+silhouettes) instead of the visual hull. Sources tried: T²-Splat's relight mesh (option 1) and a COLMAP
+PatchMatch (known poses) + TSDF surface (`scripts/mvs_init.py`, option 2). Monocular priors (option 3) not needed.
+
+SynthGeo GT geometry after full training (acc/compl mean %, smooth normal err, slab offset, object depth err %):
+
+| Scene | Init | Acc | Compl | Normal | Slab | Obj depth |
+|---|---|---|---|---|---|---|
+| textured | hull | 0.338 | 0.190 | 2.1° | −0.074 | 0.163 |
+| textured | T²-Splat | **0.027** | **0.086** | **1.8°** | −0.045 | **0.031** |
+| textured | MVS | 0.028 | 0.091 | 1.9° | −0.043 | 0.035 |
+| glossy | hull | 0.350 | 0.273 | 2.6° | −0.076 | 0.269 |
+| glossy | T²-Splat | **0.075** | **0.142** | **2.3°** | −0.047 | **0.128** |
+| glossy | MVS | 0.250 | 0.201 | 3.6° | −0.043 | 0.354 |
+
+MVS is as good as T²-Splat on texture but fails on glossy surfaces (raw MVS normal err 41°). The raw MVS slab
+is at +0.007 yet ends at −0.043 after training: the remaining slab bulge is created by the optimisation
+(textureless plane unconstrained), not by the init → next: planarity / anchoring term.
+
+Four real scenes, `OTO_ARGS="--init mesh:output/synthetic4relight/@SCENE@" scripts/oto_real.sh` (v6) vs hull (v5), means:
+
+| | Albedo | Rough MSE | Relight env6/12 | Parity env6/12 | Cycles GI vs GT env6/12 |
+|---|---|---|---|---|---|
+| v5 hull | 23.21 | 0.0658 | 27.22 / 26.99 | 31.81 / 33.29 | 26.31 / 26.20 |
+| v6 T²-Splat init | **24.44** | **0.0609** | **27.95 / 28.21** | **32.19 / 33.54** | **26.98 / 27.19** |
+
+Largest gain on hotdog (Cycles GI +2.1 / +3.1 dB, albedo 20.7 → 24.5); jugs +0.4 dB; chair, air_baloons ≈ equal.
+T²-Splat init is now the recommended geometry stage.
