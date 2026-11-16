@@ -469,9 +469,25 @@ Per scene the only regressions are chair roughness MSE (0.025 → 0.049) and ful
 IoU 0.987–0.988 vs 0.997). Remaining geometry issues: visual-hull remnants at contact regions (object bases) and
 the textureless-plane bulge.
 
+### Shadow-aware geometry (2026-11-16)
+`relight/shadowmap.py`: batched orthographic shadow maps in nvdiffrast with antialiased height maps → soft visibility
+differentiable w.r.t. receiver and occluder, including shadow boundaries (`tests/test_shadowmap.py`). Geometry stage
+(`train_oto.py --pbr-from 4000`, default): diffuse becomes albedo/π · shadowed irradiance · (1 − F0·A − B) over all
+32 Fibonacci light bins every iteration (importance-sampled 32 of 512 was too noisy: 27–31 dB vs 33.8 deterministic),
+edge-aware albedo smoothness; Stage B keeps it. ~110 ms/iteration, peak 15–17 GB.
+
+SynthGeo glossy (learned light ≈ GT light): face normal error 5.3° → **2.8°**, median accuracy 0.073 → **0.034**,
+object mean |depth error| 1.09% → **0.27%** (T²-Splat 0.44%) — neck/chin hull remnants removed. Slab bulge unchanged
+(−0.076): uniform plane + soft sky give no shadow signal. Missing GT surface is mostly down-facing (never observed).
+
+Real scenes (v5, means over 4): materials/relighting ≈ v4 (albedo 23.21 vs 23.19, rough MSE 0.066 vs 0.063, relight
+27.22/26.99 vs 27.27/26.94), Blender parity 31.8/33.3 vs 31.0/32.2, Cycles GI vs GT 26.31/26.20 vs 26.15/26.03.
+Normal deviation 1.0–4.8°, layering 0–3%. Contact-region remnants under undercuts (jug bellies) persist: never
+directly observed, mask-uncarvable, and both remnant and true surface are in shadow.
+
 ## 6. Immediate next steps
-1. Visual-hull remnants / textureless ambiguity: shadow/visibility-aware appearance in the geometry stage (cast
-   shadows constrain depth) or better initialisation; insertion for concavities.
-2. Phase 3 (learned light) and Phase 4 (indirect light) on the new geometry; make `oto_real.sh` the default
-   geometry stage of `relight_all.sh`.
-3. Speed: Stage A ~20 min, Stage B ~6 min per scene (shared GPUs).
+1. Undercut / contact-region geometry: better initialisation than the visual hull (e.g. depth-fused surface from
+   the opaque soup itself, or inward pressure on regions only observed at grazing angles).
+2. Phase 4 indirect light (also a compensation source at contacts) and Phase 3 learned light on the new geometry;
+   make `oto_real.sh` the default geometry stage of `relight_all.sh`.
+3. Textureless-plane depth (slab bulge): depth/planarity prior.
