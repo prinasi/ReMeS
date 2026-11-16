@@ -12,7 +12,8 @@ ROOT = Path(__file__).resolve().parents[1]
 COLS = [("accuracy_mean_pct", "Acc. mean"), ("accuracy_median_pct", "Acc. median"),
         ("completeness_mean_pct", "Compl. mean"), ("normal_err_face_median_deg", "Normal err (face, med)"),
         ("normal_err_smooth_median_deg", "Normal err (smooth, med)"), ("screen_normal_mae_smooth_deg", "Screen normal MAE"),
-        ("second_surface_within_1_edges", "Layering")]
+        ("second_surface_within_1_edges", "Layering"), ("slab_depth_offset_median", "Slab depth offset"),
+        ("object_depth_abs_mean_pct", "Object |depth err| mean")]
 
 
 def main():
@@ -32,6 +33,9 @@ def main():
             r = json.loads(f.read_text())
             cells = []
             for k, _ in COLS:
+                if k not in r:
+                    cells.append("—")
+                    continue
                 v = r[k]
                 cells.append(f"{100 * v:.0f}%" if k == "second_surface_within_1_edges"
                              else f"{v:.1f}°" if k.endswith("_deg") else f"{v:.3f}")

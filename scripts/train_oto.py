@@ -29,7 +29,8 @@ from relight.envmap import downsample_envmap, load_envmap  # noqa: E402
 from relight.gbuffer import mvp_matrix  # noqa: E402
 from relight.io import tonemap, write_png  # noqa: E402
 from relight.mesh import FrozenMesh, save_relight_mesh  # noqa: E402
-from relight.oto import OpaqueSoup, visual_hull_soup  # noqa: E402
+from relight.oto import OpaqueSoup, albedo_smoothness, visual_hull_soup  # noqa: E402
+from relight.shadowmap import ShadowMapper, sample_directions  # noqa: E402
 from relight.shading import LearnableEnvLight, brdf_lut, fibonacci_sphere  # noqa: E402
 
 SKIP_TOP_ROWS = 5
@@ -39,10 +40,14 @@ def gamma(x):
     return (x.clamp_min(0) + 1e-4) ** (1 / 2.2)
 
 
-def stage_b(a, soup, views, light, lut, light_opt, log, t0):
+def stage_b(a, soup, views, light, lut, light_opt, log, t0, mapper=None):
     from relight.oto import ConnectedMesh, rdt_remesh, weld_soup
     from relight.orient import orient_components, vertex_normals
     from relight.visibility import median_edge_length
+    if light is not None and mapper is not None and a.pbr_from >= 0 and not soup.is_albedo:
+        mean_alb = soup.convert_to_albedo(mapper, light)
+        soup.is_albedo = True
+        print(f"[stage B] switched to physical shading before remeshing; mean albedo {mean_alb:.3f}", flush=True)
     soup_mesh = FrozenMesh(soup.verts.detach().reshape(-1, 3), soup.faces())
     if a.remesh == "poisson":
         Vw, faces, Aw = poisson_remesh(soup, [v[0] for v in views], a.poisson_depth, a.poisson_faces)
@@ -67,10 +72,14 @@ def stage_b(a, soup, views, light, lut, light_opt, log, t0):
         cam, m, gt, mvp = random.choice(views)
         if light is not None:
             light.refresh()
-        o = cm.render(cam, light, lut, mvp=mvp)
+        shadow = shadow_context(mapper, light, cm.verts, cm.faces, a.shadow_dirs) \
+            if (soup.is_albedo and mapper is not None and light is not None) else None
+        o = cm.render(cam, light, lut, mvp=mvp, shadow=shadow)
         l_img = (gamma(o["rgb"]) - gt).abs().mean()
         loss = l_img + a.lambda_mask * (o["alpha"] - m).abs().mean() + a.lambda_dn * cm_dn(o) \
             + a.lambda_lap * cm.laplacian_loss() + a.lambda_nc * cm.normal_consistency_loss()
+        if shadow is not None and a.lambda_albedo > 0:
+            loss = loss + a.lambda_albedo * albedo_smoothness(o, gt)
         if light is not None and a.env_tv > 0 and light.log_env.requires_grad:
             loss = loss + a.env_tv * light.tv()
         loss.backward()
@@ -128,6 +137,12 @@ def poisson_remesh(soup, cameras, depth, target_faces=0):
     return pm.vertices, pm.faces.long(), A
 
 
+def shadow_context(mapper, light, V, faces, k):
+    """Importance-sample k light bins and render their (differentiable) shadow maps."""
+    idx, prob = sample_directions(light.bins, light.dirs, k)
+    return {"mapper": mapper, "maps": mapper.render(V, faces, light.dirs[idx]), "idx": idx, "prob": prob}
+
+
 def carve_views(views):
     """(camera, mask) for silhouette carving; the zeroed top rows are unknown, i.e. treated as inside."""
     out = []
@@ -166,6 +181,14 @@ def main():
     p.add_argument("--no-specular", action="store_true", help="ablation: diffuse only")
     p.add_argument("--lambda-mask", type=float, default=0.1)
     p.add_argument("--lambda-dn", type=float, default=0.05, help="normal-depth consistency weight")
+    p.add_argument("--pbr-from", type=int, default=4000,
+                   help="switch diffuse from free radiance to albedo x shadowed irradiance at this iteration (-1 = never)")
+    p.add_argument("--shadow-dirs", type=int, default=32,
+                   help="light bins (Fibonacci) for diffuse irradiance; all are shadow-mapped every iteration")
+    p.add_argument("--shadow-res", type=int, default=512)
+    p.add_argument("--lambda-albedo", type=float, default=0.02, help="edge-aware albedo smoothness (physical mode)")
+    p.add_argument("--max-tris-pbr", type=int, default=450_000,
+                   help="triangle cap once physical shading is on (batched shadow maps scale with triangle count)")
     p.add_argument("--dn-from", type=int, default=1000)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--stage-b-iters", type=int, default=5000, help="0 = stop after the soup")
@@ -205,16 +228,23 @@ def main():
         soup = OpaqueSoup(st["verts"].cuda(), lr_pos=a.lr_pos, lr_color=a.lr_color, lr_spec=a.lr_spec)
         soup.diffuse.data.copy_(st["diffuse"].cuda())
         soup.spec.data.copy_(st["spec"].cuda())
-        print(f"[resume] {soup.num:,} soup triangles from {a.resume}", flush=True)
+        soup.is_albedo = bool(st.get("is_albedo", False))
+        print(f"[resume] {soup.num:,} soup triangles from {a.resume} (diffuse = "
+              f"{'albedo' if soup.is_albedo else 'radiance'})", flush=True)
     else:
         verts = visual_hull_soup([(c, m.cpu().numpy()) for c, m, _, _ in views], res=a.hull_res, max_tris=a.max_tris)
         soup = OpaqueSoup(verts, lr_pos=a.lr_pos, lr_color=a.lr_color, lr_spec=a.lr_spec)
         print(f"[init] visual hull {a.hull_res}^3 -> {soup.num:,} triangles", flush=True)
+        soup.is_albedo = False
+    with torch.no_grad():
+        V0 = soup.verts.reshape(-1, 3)
+        lo, hi = V0.min(0).values, V0.max(0).values
+    mapper = ShadowMapper(0.5 * (lo + hi), 0.55 * float((hi - lo).norm()), res=a.shadow_res)
 
     lut = brdf_lut()
     light = None
     if not a.no_specular:
-        light = LearnableEnvLight(fibonacci_sphere(64), (a.env_res, 2 * a.env_res), init=1.0).cuda()
+        light = LearnableEnvLight(fibonacci_sphere(a.shadow_dirs), (a.env_res, 2 * a.env_res), init=1.0).cuda()
         if a.oracle_env:
             env = downsample_envmap(load_envmap(ds.envmap_path(a.oracle_env)), a.env_res, 2 * a.env_res)
             light.log_env.data.copy_(torch.log(env.clamp_min(1e-4)))
@@ -230,10 +260,19 @@ def main():
         cam, m, gt, mvp = random.choice(views)
         if light is not None:
             light.refresh()
-        o = soup.render(cam, light, lut, mvp=mvp, track_coverage=True)
+        if light is not None and a.pbr_from >= 0 and it == a.pbr_from and not soup.is_albedo:
+            mean_alb = soup.convert_to_albedo(mapper, light)
+            soup.is_albedo = True
+            print(f"[{it:6d}] switched to physical shading (albedo x shadowed irradiance); mean albedo {mean_alb:.3f}",
+                  flush=True)
+        shadow = shadow_context(mapper, light, soup.verts.reshape(-1, 3), soup.faces(), a.shadow_dirs) \
+            if soup.is_albedo else None
+        o = soup.render(cam, light, lut, mvp=mvp, track_coverage=True, shadow=shadow)
         l_img = (gamma(o["rgb"]) - gt).abs().mean()
         l_mask = (o["alpha"] - m).abs().mean()
         loss = l_img + a.lambda_mask * l_mask
+        if shadow is not None and a.lambda_albedo > 0:
+            loss = loss + a.lambda_albedo * albedo_smoothness(o, gt)
         l_dn = torch.zeros((), device="cuda")
         if a.lambda_dn > 0 and it >= a.dn_from:
             l_dn = soup.depth_normal_loss(o)
@@ -252,7 +291,8 @@ def main():
             n_split = 0
             if it <= a.densify_until:
                 cand = (soup.max_cov > a.cov_split).nonzero()[:, 0]
-                room = max(0, a.max_tris - soup.num)
+                cap = min(a.max_tris, a.max_tris_pbr) if soup.is_albedo else a.max_tris
+                room = max(0, cap - soup.num)
                 if cand.numel() > room:
                     cand = cand[torch.argsort(soup.max_cov[cand], descending=True)[:room]]
                 n_split = soup.split(cand)
@@ -276,7 +316,7 @@ def main():
     n_final = soup.prune(soup.max_cov < 1)
     print(f"[final] removed {n_final:,} never-visible triangles -> {soup.num:,}", flush=True)
 
-    torch.save(soup.state_dict(), out / "soup.pt")
+    torch.save({**soup.state_dict(), "is_albedo": soup.is_albedo}, out / "soup.pt")
     if light is not None:
         torch.save({"log_env": light.log_env.detach().cpu()}, out / "env.pt")
     V = soup.verts.detach().reshape(-1, 3)
@@ -285,12 +325,18 @@ def main():
     save_relight_mesh(mesh, out / "soup_mesh.pt", {"stage": "oto_soup", "args": vars(a)})
     final_mesh, render_obj = mesh, soup
     if a.stage_b_iters > 0:
-        final_mesh, render_obj = stage_b(a, soup, views, light, lut, light_opt if light is not None else None, log, t0)
+        final_mesh, render_obj = stage_b(a, soup, views, light, lut, light_opt if light is not None else None, log, t0,
+                                         mapper)
     save_relight_mesh(final_mesh, out / "relight_mesh.pt",
                       {"stage": "oto_connected" if a.stage_b_iters > 0 else "oto_soup", "args": vars(a)})
     with torch.no_grad():
+        shadow = None
+        if soup.is_albedo and light is not None:
+            Vr = render_obj.verts.reshape(-1, 3)
+            Fr = render_obj.faces() if callable(render_obj.faces) else render_obj.faces
+            shadow = shadow_context(mapper, light, Vr, Fr, a.shadow_dirs)
         for k, (cam, m, gt, mvp) in enumerate(views[::25]):
-            o = render_obj.render(cam, light, lut, mvp=mvp)
+            o = render_obj.render(cam, light, lut, mvp=mvp, shadow=shadow)
             nimg = (o["normal"] * 0.5 + 0.5) * o["mask"][..., None]
             write_png(out / "images" / f"train_{k}.png",
                       torch.cat([gt, gamma(o["rgb"]).clamp(0, 1), nimg], 1).cpu().numpy())

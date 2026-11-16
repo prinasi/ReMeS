@@ -71,7 +71,7 @@ def evaluate(pred: FrozenMesh, gt: FrozenMesh, n_obj: int, ds, n_samples=1_000_0
            "normal_err_smooth_median_deg": float(ang_smooth[on_obj].median()),
            "normal_err_smooth_mean_deg": float(ang_smooth[on_obj].mean())}
     # screen-space normal MAE on Suzanne pixels
-    errs_s, errs_f = [], []
+    errs_s, errs_f, dz_slab, dz_obj = [], [], [], []
     for i in range(0, ds.num_views("test"), 5):
         cam = ds.cameras("test")[i]
         gg, gp = rasterize(gt, cam), rasterize(pred, cam)
@@ -81,9 +81,17 @@ def evaluate(pred: FrozenMesh, gt: FrozenMesh, n_obj: int, ds, n_samples=1_000_0
         psm = F.normalize((gp["bary"][..., :, None] * pv).sum(-2), dim=-1)
         errs_s.append(torch.rad2deg(torch.acos((psm * gnorm).sum(-1).abs().clamp(0, 1)))[m])
         errs_f.append(torch.rad2deg(torch.acos((gp["normal"] * gnorm).sum(-1).abs().clamp(0, 1)))[m])
+        both = gg["mask"] & gp["mask"]
+        dz = gp["depth"] - gg["depth"]                                   # < 0: prediction in front of GT
+        dz_slab.append(dz[both & (gg["face_id"] >= n_obj)])
+        dz_obj.append(dz[both & (gg["face_id"] < n_obj)])
     es, ef = torch.cat(errs_s), torch.cat(errs_f)
     rep.update(screen_normal_mae_smooth_deg=float(es.mean()), screen_normal_mae_face_deg=float(ef.mean()),
                screen_normal_median_smooth_deg=float(es.median()))
+    dzs, dzo = torch.cat(dz_slab), torch.cat(dz_obj)
+    rep.update(slab_depth_offset_median=float(dzs.median()) if dzs.numel() else float("nan"),
+               object_depth_offset_median=float(dzo.median()) if dzo.numel() else float("nan"),
+               object_depth_abs_mean_pct=100 * float(dzo.abs().mean()) / diag if dzo.numel() else float("nan"))
     rep.update(layering(pred, ds, median_edge_length(pred)))
     return rep
 

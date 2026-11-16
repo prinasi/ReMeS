@@ -74,9 +74,10 @@ class OpaqueSoup:
         return torch.cat([DIFFUSE_MAX * torch.sigmoid(self.diffuse), torch.sigmoid(self.spec[..., :1]),
                           lo + (hi - lo) * torch.sigmoid(self.spec[..., 1:])], -1).reshape(-1, 5)
 
-    def render(self, cam, light, lut, mvp: torch.Tensor | None = None, track_coverage: bool = False) -> dict:
+    def render(self, cam, light, lut, mvp: torch.Tensor | None = None, track_coverage: bool = False,
+               shadow: dict | None = None) -> dict:
         out = render_triangles(self.verts.reshape(-1, 3), self.faces(), self.corner_attributes(), self.face_normals(),
-                               cam, light, lut, mvp)
+                               cam, light, lut, mvp, shadow)
         if track_coverage:
             with torch.no_grad():
                 m = out["mask"]
@@ -152,6 +153,30 @@ class OpaqueSoup:
         self._rebuild(keep.nonzero()[:, 0], new)
         return int(idx.numel())
 
+    @torch.no_grad()
+    def convert_to_albedo(self, mapper, light, k: int = 4096, chunk: int = 65536):
+        """Switch the diffuse attribute from radiance to albedo: a = L_d · π / E_vis per corner
+        (irradiance on the lit side, with shadow-map visibility)."""
+        from relight.shadowmap import sample_directions
+        idx, prob = sample_directions(light.bins, light.dirs, k)
+        w = light.dirs[idx]
+        V = self.verts.reshape(-1, 3)
+        maps = mapper.render(V, self.faces(), w)
+        fn = self.face_normals().repeat_interleave(3, 0)
+        wl = light.bins[idx] / (len(idx) * prob)[:, None]
+        rad = DIFFUSE_MAX * torch.sigmoid(self.diffuse.reshape(-1, 3))
+        alb = torch.empty_like(rad)
+        for s in range(0, V.shape[0], chunk):
+            vis = mapper.visibility(maps, V[s:s + chunk])
+            n = fn[s:s + chunk]
+            e1 = (vis * (n @ w.T).clamp_min(0)) @ wl
+            e2 = (vis * (-n @ w.T).clamp_min(0)) @ wl
+            e = torch.maximum(e1, e2)
+            alb[s:s + chunk] = rad[s:s + chunk] * math.pi / (0.96 * e.clamp_min(1e-3))
+        alb = alb.clamp(0.01, 0.98)
+        self.diffuse.data.copy_(_logit(alb / DIFFUSE_MAX).reshape(self.diffuse.shape))
+        return float(alb.mean())
+
     def reset_coverage(self):
         self.max_cov.zero_()
 
@@ -170,8 +195,15 @@ class OpaqueSoup:
 
 # ---------------------------------------------------------------------- shared renderer
 def render_triangles(V: torch.Tensor, faces: torch.Tensor, attrs: torch.Tensor, face_normals: torch.Tensor, cam, light,
-                     lut, mvp: torch.Tensor | None = None) -> dict:
-    """Opaque z-buffer render of triangles with per-vertex attrs [N, 5] = (diffuse rgb, F0, roughness)."""
+                     lut, mvp: torch.Tensor | None = None, shadow: dict | None = None) -> dict:
+    """Opaque z-buffer render of triangles with per-vertex attrs [N, 5] = (diffuse, F0, roughness).
+
+    shadow=None: the diffuse attribute is outgoing radiance (free appearance).
+    shadow={"mapper", "maps", "idx", "prob"}: the diffuse attribute is albedo, shaded physically as
+        albedo/π · E · (1 - F0·A - B),  E = Σ_k L_k V_k max(n·w_k, 0) / (K p_k)
+    with differentiable shadow-map visibility V (relight/shadowmap.py) over K importance-sampled
+    light bins of ``light`` — cast shadows must then be explained by geometry.
+    """
     dev = V.device
     mvp = mvp_matrix(cam).to(dev) if mvp is None else mvp
     clip = (torch.cat([V, torch.ones_like(V[:, :1])], -1) @ mvp.T)[None].contiguous()
@@ -193,11 +225,36 @@ def render_triangles(V: torch.Tensor, faces: torch.Tensor, attrs: torch.Tensor, 
         rho = interp[..., 4][mask]
         nv = (-(dm * nm).sum(-1)).clamp(1e-4, 1)
         ab = lookup_lut(lut, nv, rho)
-        spec = light.specular(refl, rho) * (interp[..., 3][mask][:, None] * ab[:, :1] + ab[:, 1:])
-        rgb = rgb.index_put(mask.nonzero(as_tuple=True), rgb[mask] + spec)
+        spec_albedo = interp[..., 3][mask][:, None] * ab[:, :1] + ab[:, 1:]
+        spec = light.specular(refl, rho) * spec_albedo
+        base = rgb[mask]
+        if shadow is not None:
+            w = light.dirs[shadow["idx"]]                                                 # [K, 3]
+            vis = shadow["mapper"].visibility(shadow["maps"], pos[mask])                  # [N, K]
+            cos = (nm @ w.T).clamp_min(0)
+            wl = light.bins[shadow["idx"]] / (len(shadow["idx"]) * shadow["prob"])[:, None]
+            irr = (vis * cos) @ wl                                                        # [N, 3]
+            base = base / math.pi * irr * (1 - spec_albedo).clamp_min(0)
+        rgb = rgb.index_put(mask.nonzero(as_tuple=True), base + spec)
     rgba = torch.cat([rgb * mask[..., None], mask[..., None].float()], -1)
     aa = dr.antialias(rgba[None].contiguous(), rast, clip, faces)[0]
-    return {"rgb": aa[..., :3], "alpha": aa[..., 3], "mask": mask, "normal": n, "position": pos, "tri": tri}
+    return {"rgb": aa[..., :3], "alpha": aa[..., 3], "mask": mask, "normal": n, "position": pos, "tri": tri,
+            "albedo": interp[..., 0:3]}
+
+
+def albedo_smoothness(out: dict, gt: torch.Tensor, alpha: float = 20.0) -> torch.Tensor:
+    """Edge-aware screen-space smoothness of the rendered albedo: |∇a| weighted by exp(-alpha |∇I_gt|).
+    Keeps smooth shading variation out of the albedo (it must come from normals / shadows)."""
+    a, m = out["albedo"], out["mask"]
+    loss, n = a.new_zeros(()), 0
+    for sl0, sl1 in (((slice(None), slice(1, None)), (slice(None), slice(None, -1))),
+                     ((slice(1, None), slice(None)), (slice(None, -1), slice(None)))):
+        valid = m[sl0] & m[sl1]
+        if valid.any():
+            w = torch.exp(-alpha * (gt[sl0] - gt[sl1]).abs().mean(-1))
+            loss = loss + (w * (a[sl0] - a[sl1]).abs().mean(-1))[valid].mean()
+            n += 1
+    return loss / max(n, 1)
 
 
 # ---------------------------------------------------------------------- Stage B: weld + RDT + connected mesh
@@ -285,8 +342,9 @@ class ConnectedMesh:
         return torch.cat([DIFFUSE_MAX * torch.sigmoid(self.diffuse), torch.sigmoid(self.spec[:, :1]),
                           lo + (hi - lo) * torch.sigmoid(self.spec[:, 1:])], -1)
 
-    def render(self, cam, light, lut, mvp=None, track_coverage=False):
-        out = render_triangles(self.verts, self.faces, self.attributes(), self.face_normals(), cam, light, lut, mvp)
+    def render(self, cam, light, lut, mvp=None, track_coverage=False, shadow=None):
+        out = render_triangles(self.verts, self.faces, self.attributes(), self.face_normals(), cam, light, lut, mvp,
+                               shadow)
         if track_coverage:
             with torch.no_grad():
                 m = out["mask"]
