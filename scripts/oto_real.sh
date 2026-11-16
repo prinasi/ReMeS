@@ -2,6 +2,8 @@
 # OTO-style geometry (Stage A soup + Stage B connected mesh) on Synthetic4Relight scenes, then the
 # downstream pipeline: Phase 2 (oracle light) and Phase 5 (Blender) on the new relight_mesh.pt.
 #   bash scripts/oto_real.sh <gpu> <tag> <scene> [<scene> ...]
+# Extra train_oto.py arguments via OTO_ARGS; "@SCENE@" is replaced by the scene name, e.g.
+#   OTO_ARGS="--init mesh:output/synthetic4relight/@SCENE@" bash scripts/oto_real.sh 0 v6 jugs
 set -euo pipefail
 ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 PY=${PYTHON:-python}
@@ -10,7 +12,7 @@ source "$ROOT/scripts/env.sh"
 for scene in "$@"; do
     M="$ROOT/output/oto_s4r/$TAG/$scene"
     run() { echo "=== [$scene] $*"; CUDA_VISIBLE_DEVICES=$GPU "$PY" "$@"; }
-    run "$ROOT/scripts/train_oto.py" --data "$ROOT/data/Synthetic4Relight" --scene "$scene" --out "$M"
+    run "$ROOT/scripts/train_oto.py" --data "$ROOT/data/Synthetic4Relight" --scene "$scene" --out "$M" ${OTO_ARGS//@SCENE@/$scene}
     run "$ROOT/scripts/eval_geometry.py" -m "$M" --scene "$scene" --relight-mesh || true
     run "$ROOT/scripts/diagnose_geometry.py" -m "$M" --scene "$scene"
     run "$ROOT/scripts/train_pbr.py" -m "$M" --scene "$scene" --out pbr_oracle

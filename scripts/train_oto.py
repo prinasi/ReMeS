@@ -202,6 +202,9 @@ def main():
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--stage-b-iters", type=int, default=5000, help="0 = stop after the soup")
     p.add_argument("--resume", default="", help="dir with soup.pt (+ env.pt): skip Stage A")
+    p.add_argument("--init", default="hull",
+                   help="'hull' (visual hull) or 'mesh:<dir or relight_mesh.pt>' (e.g. T²-Splat or MVS surface)")
+    p.add_argument("--init-tris", type=int, default=40_000)
     p.add_argument("--weld-eps", type=float, default=0.5, help="weld radius in median soup edge lengths")
     p.add_argument("--rdt-mode", default="manifold", choices=("manifold", "g"))
     p.add_argument("--remesh", default="poisson", choices=("rdt", "poisson"),
@@ -241,9 +244,19 @@ def main():
         print(f"[resume] {soup.num:,} soup triangles from {a.resume} (diffuse = "
               f"{'albedo' if soup.is_albedo else 'radiance'})", flush=True)
     else:
-        verts = visual_hull_soup([(c, m.cpu().numpy()) for c, m, _, _ in views], res=a.hull_res, max_tris=a.max_tris)
+        if a.init == "hull":
+            verts = visual_hull_soup([(c, m.cpu().numpy()) for c, m, _, _ in views], res=a.hull_res, max_tris=a.max_tris)
+            print(f"[init] visual hull {a.hull_res}^3 -> {verts.shape[0]:,} triangles", flush=True)
+        elif a.init.startswith("mesh:"):
+            from relight.mesh import load_relight_mesh
+            from relight.oto import surface_soup
+            src = load_relight_mesh(a.init[5:])
+            verts, info = surface_soup(src, carve_views(views), n_tris=a.init_tris)
+            print(f"[init] surface {a.init[5:]} ({src.faces.shape[0]:,} faces) -> Poisson {info['poisson_faces']:,} "
+                  f"-> {verts.shape[0]:,} triangles (r={info['radius']:.4f})", flush=True)
+        else:
+            raise ValueError(a.init)
         soup = OpaqueSoup(verts, lr_pos=a.lr_pos, lr_color=a.lr_color, lr_spec=a.lr_spec)
-        print(f"[init] visual hull {a.hull_res}^3 -> {soup.num:,} triangles", flush=True)
         soup.is_albedo = False
     with torch.no_grad():
         V0 = soup.verts.reshape(-1, 3)

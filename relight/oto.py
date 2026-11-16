@@ -521,3 +521,38 @@ def visual_hull_soup(views, res: int = 128, bbox: float = 1.5, size_factor: floa
     flip = (fn * normals).sum(-1) < 0
     corners[flip] = corners[flip][:, [0, 2, 1]]
     return corners
+
+
+def spawn_triangles(centers: torch.Tensor, normals: torch.Tensor, radius, seed: int = 0) -> torch.Tensor:
+    """Small equilateral triangles [N, 3, 3] centred at `centers`, in the tangent plane of `normals`
+    (random in-plane rotation), wound so that the face normal follows `normals`."""
+    g = torch.Generator(device=centers.device).manual_seed(seed)
+    n = F.normalize(normals, dim=-1)
+    a = F.normalize(torch.cross(n, torch.randn(n.shape, generator=g, device=n.device), dim=-1), dim=-1)
+    b = torch.cross(n, a, dim=-1)
+    r = torch.as_tensor(radius, dtype=torch.float32, device=centers.device).reshape(-1, 1, 1) \
+        if torch.is_tensor(radius) else radius
+    angs = torch.tensor([0.0, 2 * math.pi / 3, 4 * math.pi / 3], device=centers.device)
+    corners = centers[:, None] + r * (torch.cos(angs)[None, :, None] * a[:, None] + torch.sin(angs)[None, :, None] * b[:, None])
+    fn = torch.cross(corners[:, 1] - corners[:, 0], corners[:, 2] - corners[:, 0], dim=-1)
+    flip = (fn * n).sum(-1) < 0
+    corners[flip] = corners[flip][:, [0, 2, 1]]
+    return corners
+
+
+@torch.no_grad()
+def surface_soup(mesh, views, n_tris: int = 40_000, poisson_depth: int = 9, carve_dilate: int = 2,
+                 size_factor: float = 0.7, seed: int = 0) -> tuple[torch.Tensor, dict]:
+    """Initial soup on a given surface (instead of the visual hull): single-sheet screened Poisson of the
+    oriented input mesh, silhouette-carved, then n_tris small triangles at area-weighted samples."""
+    from relight.geomfilter import poisson, sample_surface
+    from relight.mesh import FrozenMesh
+    pm = poisson(mesh, depth=poisson_depth)
+    keep = ~outside_masks(pm.vertices[pm.faces.long()].mean(1), views, carve_dilate)
+    pm = FrozenMesh(pm.vertices, pm.faces[keep].contiguous())
+    from relight.orient import vertex_normals
+    pm.vertex_normals = vertex_normals(pm.vertices, pm.faces)
+    pts, nrm, _ = sample_surface(pm, n_tris, seed=seed)
+    area = float(pm.face_areas.sum())
+    r = size_factor * math.sqrt(area / n_tris)
+    return spawn_triangles(pts, nrm, r, seed), {"poisson_faces": int(pm.faces.shape[0]), "area": area, "radius": r}
