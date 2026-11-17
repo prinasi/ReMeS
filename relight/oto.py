@@ -237,6 +237,9 @@ def _shade_layer(rast, V, faces, attrs, face_normals, o, light, lut, shadow):
             cos = (nm @ w.T).clamp_min(0)
             wl = light.bins[shadow["idx"]] / (len(shadow["idx"]) * shadow["prob"])[:, None]
             irr = (vis * cos) @ wl                                                        # [N, 3]
+            if shadow.get("e_ind") is not None:                       # one-bounce indirect (relight/indirect.py)
+                e_pix, _ = dr.interpolate(shadow["e_ind"][None].contiguous(), rast, faces)
+                irr = irr + e_pix[0][mask]
             base = base / math.pi * irr * (1 - spec_albedo).clamp_min(0)
         rgb = rgb.index_put(mask.nonzero(as_tuple=True), base + spec)
     return rgb * mask[..., None], mask, n, pos, tri, interp
@@ -269,10 +272,11 @@ def render_triangles(V: torch.Tensor, faces: torch.Tensor, attrs: torch.Tensor, 
     """Opaque z-buffer render of triangles with per-vertex attrs [N, 5] = (diffuse, F0, roughness).
 
     shadow=None: the diffuse attribute is outgoing radiance (free appearance).
-    shadow={"mapper", "maps", "idx", "prob"}: the diffuse attribute is albedo, shaded physically as
+    shadow={"mapper", "maps", "idx", "prob"[, "e_ind"]}: the diffuse attribute is albedo, shaded physically as
         albedo/π · E · (1 - F0·A - B),  E = Σ_k L_k V_k max(n·w_k, 0) / (K p_k)
     with differentiable shadow-map visibility V (relight/shadowmap.py) over K importance-sampled
-    light bins of ``light`` — cast shadows must then be explained by geometry.
+    light bins of ``light`` — cast shadows must then be explained by geometry. Optional "e_ind" [V, 3]:
+    per-vertex one-bounce indirect irradiance added to E (Stage B, relight/indirect.py).
 
     soft_edge_tau > 0: OTO two-layer + 2D-SDF gradient, forward unchanged. The second depth layer is peeled
     and shaded (C2); image = C1_aa + (α1 - sg(α1)) · (C1 - C2), α1 = σ(τ·d_in): pixels within ~1/τ px inside

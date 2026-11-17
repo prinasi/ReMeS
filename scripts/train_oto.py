@@ -95,7 +95,12 @@ def stage_b(a, soup, views, light, lut, light_opt, log, t0, mapper=None):
     cm.is_albedo = physical_b
     if a.grad_diag:
         grad_diagnostic(a, cm, views, light, lut, mapper if physical_b else None, a.grad_diag + "_start.pt")
+    ind = None
     for it in range(1, a.stage_b_iters + 1):
+        if a.indirect_b and physical_b and ((it - 1) % a.indirect_every == 0 or ind is None):
+            t_ind = time.perf_counter()
+            ind = build_stage_b_indirect(cm, light, a)
+            print(f"[B {it - 1:5d}] indirect transport {ind.stats()} ({time.perf_counter() - t_ind:.1f}s)", flush=True)
         if a.remesh_every > 0 and it > 1 and (it - 1) % a.remesh_every == 0 and it <= a.stage_b_iters - a.remesh_every:
             info = cm.remesh(a.remesh_scale)
             print(f"[B {it - 1:5d}] remesh: target edge {info['target_len']:.4f}, V/F {info['before']} -> "
@@ -107,6 +112,8 @@ def stage_b(a, soup, views, light, lut, light_opt, log, t0, mapper=None):
             light.refresh()
         shadow = shadow_context(mapper, light, cm.verts, cm.faces, a.shadow_dirs) \
             if (soup.is_albedo and mapper is not None and light is not None) else None
+        if shadow is not None and ind is not None:
+            shadow["e_ind"] = stage_b_e_ind(ind, cm, light)
         o = cm.render(cam, light, lut, mvp=mvp, shadow=shadow, soft_edge_tau=a.soft_edge_tau)
         l_img = (gamma(o["rgb"]) - gt).abs().mean()
         loss = l_img + a.lambda_mask * (o["alpha"] - m).abs().mean() + a.lambda_dn * cm_dn(o) \
@@ -190,6 +197,30 @@ def carve_views(views):
         mm[:SKIP_TOP_ROWS] = 1
         out.append((cam, mm))
     return out
+
+
+@torch.no_grad()
+def build_stage_b_indirect(cm, light, a):
+    """One-bounce transport for the current Stage-B mesh: direct operator on the light's own directions,
+    gathering transport on a separate Fibonacci set (relight/indirect.py)."""
+    from relight.indirect import IndirectLight
+    from relight.orient import vertex_normals
+    from relight.visibility import median_edge_length, vertex_visibility
+    V = cm.verts.detach().contiguous()
+    mesh = FrozenMesh(V, cm.faces, vertex_normals=vertex_normals(V, cm.faces))
+    h = median_edge_length(mesh)
+    eps, tmin = 0.5 * h, a.vis_tmin_b * h
+    gdirs = fibonacci_sphere(a.indirect_dirs)
+    gather = IndirectLight.build(mesh, vertex_visibility(mesh, gdirs, eps=eps, tmin=tmin), gdirs, eps, tmin)
+    direct = IndirectLight.build_direct(mesh, vertex_visibility(mesh, light.dirs, eps=eps, tmin=tmin), light.dirs)
+    return IndirectLight(gather.M, direct)
+
+
+def stage_b_e_ind(ind, cm, light):
+    """Per-vertex indirect irradiance with the current albedo (diffuse attribute) and light; detached."""
+    with torch.no_grad():
+        alb = cm.attributes()[:, :3]
+        return ind.M @ (alb / math.pi * ind.direct_irradiance(light))
 
 
 class _DetachedReceiver:
@@ -285,6 +316,11 @@ def main():
                    help="Stage B: lambda of the smoothness-preconditioned vertex update (Nicolet et al. 2021; "
                         "relight/largesteps.py); 0 = per-coordinate Adam")
     p.add_argument("--lr-pos-ls", type=float, default=1e-3, help="Stage B vertex lr with --large-steps")
+    p.add_argument("--indirect-b", action="store_true",
+                   help="Stage B: one-bounce indirect diffuse light in the physical shading (relight/indirect.py)")
+    p.add_argument("--indirect-every", type=int, default=500, help="rebuild the transport every N Stage-B its")
+    p.add_argument("--indirect-dirs", type=int, default=256, help="gathering directions of the transport")
+    p.add_argument("--vis-tmin-b", type=float, default=10.0, help="visibility ray start offset (x median edge)")
     p.add_argument("--grad-diag", default="", help="Stage B: save per-loss-term vertex gradients (all views) to "
                                                    "<prefix>_start.pt / _end.pt")
     p.add_argument("--lr-pos", type=float, default=2e-4)

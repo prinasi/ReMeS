@@ -66,6 +66,13 @@ class IndirectLight:
         M = torch.sparse_coo_tensor(idx, torch.cat(vals), (V, V)).coalesce().to_sparse_csr()
         return cls(M, A)
 
+    @staticmethod
+    @torch.no_grad()
+    def build_direct(mesh: FrozenMesh, vis_packed: torch.Tensor, dirs: torch.Tensor) -> torch.Tensor:
+        """Direct-irradiance operator [V, K] (half) = V_vk · max(n_v·w_k, 0) for the light's own directions."""
+        cos = (mesh.vertex_normals @ dirs.T).clamp_min(0)
+        return (unpack_bits(vis_packed).float() * cos).half()
+
     @classmethod
     def cached(cls, mesh: FrozenMesh, vis_packed: torch.Tensor, dirs: torch.Tensor, path: str | Path,
                eps: float, tmin: float) -> "IndirectLight":

@@ -645,3 +645,29 @@ albedo alignment):
 The bounce term gains about as much with a learned light (+0.8 / +1.15 dB aligned relighting, +0.4 / +0.6 dB
 Cycles) as with the oracle; the learned envmap itself stays at ≈ 13.9 dB (aligned) — the remaining gap to the
 oracle (≈ 0.8–1.1 dB in Cycles) is light estimation.
+
+### Light estimation, Stage-B indirect, full-image metrics (option 2 / 3 of the post-Phase-4 plan)
+
+* **Light init from the geometry stage** (`train_pbr.py --light-init auto|<path>`, now the default with
+  `--learn-light`; falls back to the grey init when `<model>/env.pt` is absent; `--freeze-light`): the
+  geometry stage's env (fitted with shadow maps) is far closer to the GT light than Phase 3's grey-init
+  estimate (aligned light PSNR 17.95 vs 13.90). Four-scene means, learned light + indirect:
+
+| | Light PSNR | Albedo aligned | Rough MSE | Relight env6/12 aligned | Cycles GI vs GT env6/12 |
+|---|---|---|---|---|---|
+| grey init | 13.90 | 23.32 | 0.0640 | 26.76 / 26.54 | 26.47 / 26.46 |
+| env.pt init, lr 2e-2 | 16.32 | 23.55 | 0.0570 | 27.10 / 26.81 | 26.70 / 26.71 |
+| env.pt init, lr 5e-3 | 17.00 | 23.62 | 0.0570 | 27.17 / 26.78 | 26.85 / 26.76 |
+| env.pt frozen | 17.95 | 22.87 | 0.1128 | 25.74 / 25.41 | 25.64 / 25.70 |
+
+  (frozen is worse: that env was fitted under the geometry stage's coarse 32-direction shading.)
+* **Indirect light in Stage B** (`train_oto.py --indirect-b`, transport rebuilt every 500 its in ≈ 1–2 s;
+  v7 = Stage B re-run from the v6 soups): oracle-light means change by +0.04 dB (Cycles 27.34 / 27.61 vs
+  27.29 / 27.57) — no measurable benefit; off by default.
+* **Full-image metrics** (black background, per-channel albedo alignment; the InvRender / TensoIR / R3DG
+  protocol as far as the papers specify) are now also reported by `train_pbr.py` (`*_full`, `*_full_aligned`,
+  `rough_mse_full`). Learned light (env.pt init), v6: NVS 33.70, relighting 33.63 / 33.41 (aligned),
+  albedo 28.98, roughness MSE 0.0131 — vs R3DG (Tab. 2, Synthetic4Relight) 36.80 / 31.00 / 28.31 / 0.013.
+  Relighting is ahead, albedo / roughness on par; the remaining gap is NVS (−3.1 dB), consistent with R3DG's
+  free per-Gaussian indirect SH and geometry-decoupled normals (smooth shading normals). Next: a learnable
+  (exportable) normal map supervised by a monocular normal prior.

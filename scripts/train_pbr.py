@@ -168,7 +168,10 @@ def evaluate(mesh, mat, vis_packed, lights, train_light, lut, ds, stride, img_di
     rows = {k: [] for k in ("nvs_psnr_mask", "nvs_psnr_full", "albedo_psnr_aligned", "albedo_psnr_raw",
                             "rough_mse", *[f"relight_{e}_psnr_mask" for e in RELIGHT_ENVMAPS],
                             *[f"relight_{e}_psnr_full" for e in RELIGHT_ENVMAPS],
-                            *[f"relight_{e}_psnr_mask_aligned" for e in RELIGHT_ENVMAPS])}
+                            *[f"relight_{e}_psnr_mask_aligned" for e in RELIGHT_ENVMAPS],
+                            # full-image variants (black background), the InvRender / TensoIR / R3DG protocol
+                            "albedo_psnr_aligned_full", "rough_mse_full",
+                            *[f"relight_{e}_psnr_full_aligned" for e in RELIGHT_ENVMAPS])}
     scales = []
     idx = list(range(0, ds.num_views("test"), stride))
     vis_idx = set(idx[:: max(1, len(idx) // n_vis)][:n_vis])
@@ -184,10 +187,15 @@ def evaluate(mesh, mat, vis_packed, lights, train_light, lut, ds, stride, img_di
         gt_alb = gamma_to_linear(torch.from_numpy(tv.albedo).cuda())
         a_al, a_raw, sc = aligned_albedo_psnr(out["albedo"], gt_alb, mask & out["mask"])
         rows["albedo_psnr_aligned"].append(a_al)
+        sc_t = torch.tensor(sc, device="cuda")
+        om = out["mask"][..., None].float()
+        rows["albedo_psnr_aligned_full"].append(psnr(tonemap((out["albedo"] * sc_t).clamp(0, 1)) * om,
+                                                     tonemap(gt_alb) * gm[..., None]))
         rows["albedo_psnr_raw"].append(a_raw)
         scales.append(sc)
         gt_r = torch.from_numpy(tv.rough).cuda()
         rows["rough_mse"].append(float(((out["rough"][..., 0] - gt_r)[mask & out["mask"]] ** 2).mean()))
+        rows["rough_mse_full"].append(float(((out["rough"][..., 0] * om[..., 0] - gt_r * gm) ** 2).mean()))
         relit = {}
         for e in RELIGHT_ENVMAPS:
             o = render_view(mesh, mat, vis_packed, lights[e], lut, tv.camera, so=so, indirect=indirect)
@@ -200,6 +208,8 @@ def evaluate(mesh, mat, vis_packed, lights, train_light, lut, ds, stride, img_di
             o2 = render_view(mesh, mat, vis_packed, lights[e], lut, tv.camera, so=so,
                              albedo_scale=torch.tensor(sc, device="cuda"), indirect=indirect)
             rows[f"relight_{e}_psnr_mask_aligned"].append(psnr(tonemap(o2["rgb"]), g_rel, a_rel > 0.5))
+            rows[f"relight_{e}_psnr_full_aligned"].append(psnr(tonemap(o2["rgb"]) * o2["mask"][..., None],
+                                                               g_rel * a_rel[..., None]))
         if img_dir is not None and i in vis_idx:
             gray = lambda x: x.expand(*x.shape[:2], 3)
             top = torch.cat([gt * gm[..., None], pred * out["mask"][..., None],
@@ -225,6 +235,10 @@ def main():
     p.add_argument("--light", default=TRAIN_ENVMAP, help="training light (oracle)")
     p.add_argument("--learn-light", action="store_true", help="Phase 3: learn the training light")
     p.add_argument("--light-res", type=int, default=64, help="learnable envmap height (width = 2x)")
+    p.add_argument("--light-init", default="auto",
+                   help="initialise the learned light from a saved log-envmap (e.g. the geometry stage's "
+                        "<model>/env.pt, fitted with shadow maps); 'auto' = <model>/env.pt if present")
+    p.add_argument("--freeze-light", action="store_true", help="with --light-init: keep the light fixed")
     p.add_argument("--lr-light", type=float, default=2e-2)
     p.add_argument("--light-tv", type=float, default=1e-3, help="TV on the log envmap")
     p.add_argument("--light-wb", type=float, default=0.0, help="white-balance prior on the mean light colour")
@@ -302,7 +316,18 @@ def main():
         # grey init: albedo 0.5 under uniform light with ~75% visibility reproduces the mean radiance
         level = float(cache["rgb"].float().mean()) / (0.5 * 0.75)
         light = LearnableEnvLight(dirs, (a.light_res, 2 * a.light_res), init=level).cuda()
-        print(f"[light] learnable {a.light_res}x{2 * a.light_res} envmap, grey init {level:.3f}")
+        src = model / "env.pt" if a.light_init == "auto" else Path(a.light_init) if a.light_init else None
+        if src is not None and src.is_file():
+            le = torch.load(src, map_location="cuda")["log_env"].float()
+            if tuple(le.shape[:2]) != (a.light_res, 2 * a.light_res):
+                le = torch.log(downsample_envmap(torch.exp(le), a.light_res, 2 * a.light_res).clamp_min(1e-6))
+            light.log_env.data.copy_(le)
+            print(f"[light] learnable {a.light_res}x{2 * a.light_res} envmap initialised from {src}"
+                  f"{' (frozen)' if a.freeze_light else ''}")
+        else:
+            print(f"[light] learnable {a.light_res}x{2 * a.light_res} envmap, grey init {level:.3f}")
+        if a.freeze_light:
+            light.log_env.requires_grad_(False)
     else:
         light = lights[a.light]
 
@@ -320,7 +345,7 @@ def main():
     params = [mat.albedo, mat.rough] + ([mat.metal] if a.learn_metallic else []) + \
              ([mat.residual] if mat.residual is not None else [])
     groups = [{"params": params, "lr": a.lr}]
-    if a.learn_light:
+    if a.learn_light and light.log_env.requires_grad:
         groups.append({"params": [light.log_env], "lr": a.lr_light})
     opt = torch.optim.Adam(groups)
     sched = torch.optim.lr_scheduler.LambdaLR(opt, lambda it: a.lr_final_ratio ** (it / max(a.iters, 1)))
