@@ -530,3 +530,33 @@ Four real scenes, `OTO_ARGS="--init mesh:output/synthetic4relight/@SCENE@" scrip
 
 Largest gain on hotdog (Cycles GI +2.1 / +3.1 dB, albedo 20.7 → 24.5); jugs +0.4 dB; chair, air_baloons ≈ equal.
 T²-Splat init is now the recommended geometry stage.
+
+### Slab bulge diagnosis (SynthGeo, Stage A soup only, MVS init on textured unless noted)
+
+The remaining slab offset (≈ −0.045 after full training, up to ~10 cm in the middle of the slab top, edges
+correct) is the dominant remaining geometry error for relighting: with GT geometry
+(`scripts/gt_relight_mesh.py`, `oracle_geo_study.sh`) relighting is ≈ 2.6 dB better than v6, and
+`scripts/attribute_error.py` puts almost all of the gap on the slab (object within ≈ 0.7 dB of the GT-geometry fit;
+open slab and contact region 4–8 dB worse).
+
+| Stage A variant | Acc | Normal | Slab | Obj depth |
+|---|---|---|---|---|
+| default | 0.042 | 3.1° | −0.044 | 0.093 |
+| no physical shading / shadows (`--pbr-from -1`) | 0.053 | 3.1° | −0.046 | 0.104 |
+| no normal–depth term (`--lambda-dn 0`) | 0.092 | 16.8° | −0.034 | 0.079 |
+| split only, no prune (`--cov-prune 0`) | 0.048 | 3.3° | −0.037 | 0.073 |
+| no split / prune (`--densify-from 100000`) | 0.058 | 3.6° | **−0.002** | 0.108 |
+| no split / prune, 150k init triangles | 0.046 | 3.3° | **−0.005** | 0.089 |
+
+* Coverage-driven **splitting** creates the dome: front-most (largest-coverage) triangles are refined, and on a
+  textureless plane nothing pushes back, so the front layer drifts outward. Shadows / the shading model are not
+  the cause.
+* Without splitting the soup keeps its init: fixes the slab only if the init is right there (MVS on textured).
+  From the T²-Splat init the slab stays at ≈ −0.03 (T²-Splat itself is domed there; glossy too).
+* MVS has no depth on the open (textureless) slab — only near its edges / contact shadows (≈ 16 % of slab
+  pixels) — so neither a merged MVS + T²-Splat TSDF init (slab −0.03; glossy object corrupted by wrong
+  specular matches) nor the truncated MVS depth prior (`--lambda-mvs`, parallel session: slab −0.03..−0.04,
+  glossy normals 7–16°) recovers it.
+* ⇒ the open slab has no photometric or stereo depth evidence; what constrains it is the silhouette boundary
+  plus a prior. Candidates: minimal-surface / planarity prior in low-texture regions (a dome has more area than
+  the plane spanning the same boundary), or depth-neutral densification (split by image error, not coverage).
