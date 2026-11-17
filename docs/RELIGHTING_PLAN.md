@@ -671,3 +671,29 @@ oracle (≈ 0.8–1.1 dB in Cycles) is light estimation.
   Relighting is ahead, albedo / roughness on par; the remaining gap is NVS (−3.1 dB), consistent with R3DG's
   free per-Gaussian indirect SH and geometry-decoupled normals (smooth shading normals). Next: a learnable
   (exportable) normal map supervised by a monocular normal prior.
+
+### Gap to R3DG without priors (R3DG-inspired, mesh-native changes)
+
+`scripts/compare_s4r.py` prints R3DG Tab. 2 format (full-image PSNR / SSIM / LPIPS-VGG; relighting = mean of
+envmap6/12 with aligned albedo; albedo per-channel aligned). Full-image metrics now render with ss×ss
+supersampling (`--eval-ss 2`, premultiplied, as the antialiased GT): our evaluation renders had aliased
+silhouettes (jugs: +0.7 dB NVS, LPIPS −12 % from antialiasing alone). New `train_pbr.py` options:
+`--learn-normals` (per-vertex shading-normal offset, exported as glTF NORMAL; `--smooth-normal`,
+`--normal-anchor`, `--lr-normal`), `--edge-aware σ` (image-edge-aware mesh smoothness weights),
+`--ssim λ` (patch batches `--patches × --patch-size²`, D-SSIM in gamma space). Fixes: specular-occlusion
+sqrt had an infinite gradient at grazing angles (NaN once normals are learnable).
+
+Four scenes, learned light (env.pt init, lr 5e-3), v6 geometry:
+
+| | NVS PSNR / SSIM / LPIPS | Relight PSNR / SSIM / LPIPS | Albedo PSNR / SSIM / LPIPS | Rough MSE |
+|---|---|---|---|---|
+| R3DG | 36.80 / 0.982 / 0.028 | 31.00 / 0.964 / 0.050 | 28.31 / 0.951 / 0.058 | 0.0130 |
+| baseline | 34.16 / 0.970 / 0.063 | 33.83 / 0.966 / 0.074 | 29.34 / 0.946 / 0.076 | 0.0132 |
+| + learned normals | 34.43 / 0.971 / 0.062 | 33.80 / 0.966 / 0.072 | 29.41 / 0.947 / 0.075 | 0.0119 |
+| + edge-aware (σ 0.05) | 33.85 / 0.969 / 0.063 | 33.71 / 0.966 / 0.074 | 29.13 / 0.946 / 0.076 | 0.0140 |
+| + normals + edge-aware | 34.10 / 0.971 / 0.062 | 33.66 / 0.966 / 0.072 | 29.17 / 0.946 / 0.075 | 0.0129 |
+| + face textures 4×4 | 34.18 / 0.972 / 0.052 | 33.89 / 0.967 / 0.064 | 29.29 / 0.947 / 0.075 | 0.0120 |
+| + SSIM 0.2 | 34.10 / 0.971 / 0.062 | 33.87 / 0.967 / 0.073 | 29.44 / 0.946 / 0.076 | 0.0121 |
+
+LPIPS is driven by appearance resolution (per-face textures), NVS PSNR / roughness by shading normals;
+edge-aware smoothness does not help.

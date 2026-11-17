@@ -244,7 +244,7 @@ def shade(albedo, rough, metal, n, v, vis, light: EnvLight, lut: torch.Tensor,
         diffuse = diffuse * (1 - spec_albedo).clamp_min(0)
     if specular_occlusion:
         cos_r = refl @ light.dirs.T
-        cos_h = torch.sqrt(((1 + cos_r) / 2).clamp_min(0))
+        cos_h = torch.sqrt(((1 + cos_r) / 2).clamp_min(1e-8))            # finite gradient at grazing angles
         w = ggx_d(cos_h, (rough * rough).clamp_min(1e-3)[:, None]) * cos_r.clamp_min(0) + 1e-8
         so = (vis * w).sum(-1) / w.sum(-1)
         spec = spec * so[:, None]

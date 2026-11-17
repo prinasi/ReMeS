@@ -49,8 +49,9 @@ from relight.indirect import interpolate_vertex  # noqa: E402
 SKIP_TOP_ROWS = 5   # hotdog train EXRs have their top rows zeroed (dataset artifact)
 
 
-def shading_normal(mesh, face_id, bary):
-    vn = mesh.vertex_normals[mesh.faces[face_id].long()]                # [N, 3, 3]
+def shading_normal(mesh, face_id, bary, mat=None):
+    base = mesh.vertex_normals if mat is None else mat.shading_normals(mesh.vertex_normals)
+    vn = base[mesh.faces[face_id].long()]                                # [N, 3, 3]
     return F.normalize((bary[:, :, None] * vn).sum(1), dim=-1)
 
 
@@ -61,18 +62,24 @@ def surface_point(mesh, face_id, bary):
 @torch.no_grad()
 def build_pixel_cache(mesh, ds: Synthetic4Relight, alpha_thr: float) -> dict:
     """All interior foreground pixels of all training views (face, bary, camera, GT linear rgb)."""
-    fids, barys, cams, rgbs, centers = [], [], [], [], []
+    fids, barys, cams, rgbs, centers, index = [], [], [], [], [], []
+    offset = 0
     for i in range(ds.num_views("train")):
         v = ds.train_view(i)
         g = rasterize(mesh, v.camera)
         sel = g["mask"] & (torch.from_numpy(v.mask).cuda() >= alpha_thr)
         sel[:SKIP_TOP_ROWS] = False
+        im = torch.full(sel.shape, -1, dtype=torch.int32, device="cuda")          # pixel -> cache row (patches)
+        n_sel = int(sel.sum())
+        im[sel] = torch.arange(offset, offset + n_sel, dtype=torch.int32, device="cuda")
+        offset += n_sel
+        index.append(im)
         fids.append(g["face_id"][sel].int())
         barys.append(g["bary"][sel])
         cams.append(torch.full((int(sel.sum()),), i, dtype=torch.int16, device="cuda"))
         rgbs.append(torch.from_numpy(v.linear).cuda()[sel].half())
         centers.append(torch.as_tensor(v.camera.center, dtype=torch.float32))
-    return {"face_id": torch.cat(fids), "bary": torch.cat(barys), "cam": torch.cat(cams),
+    return {"index": torch.stack(index), "face_id": torch.cat(fids), "bary": torch.cat(barys), "cam": torch.cat(cams),
             "rgb": torch.cat(rgbs), "centers": torch.stack(centers).cuda()}
 
 
@@ -80,7 +87,7 @@ LAYERING = True   # set from --no-layering in main()
 
 
 def shade_points(mesh, mat, vis_packed, light, lut, face_id, bary, cam_pos, so=True, albedo_scale=None, e_ind=None):
-    n = shading_normal(mesh, face_id, bary)
+    n = shading_normal(mesh, face_id, bary, mat)
     x = surface_point(mesh, face_id, bary)
     v = F.normalize(cam_pos - x, dim=-1)
     m = mat.sample(face_id, bary)
@@ -125,6 +132,59 @@ def init_albedo(mesh, vis_packed, light, cache, chunk=1 << 17, lo=0.02, hi=0.95,
     return alb, float(seen.float().mean())
 
 
+@torch.no_grad()
+def edge_aware_weights(mesh, cache, edges, sigma: float, chunk=1 << 18) -> torch.Tensor:
+    """exp(-|c_a - c_b| / sigma) per mesh edge, c = vertex mean of observed gamma-space colour (barycentric
+    weights over all cached training pixels): ~1 inside uniform regions, ~0 across texture / shading edges."""
+    V = mesh.vertices.shape[0]
+    num = torch.zeros(V, 3, device="cuda")
+    den = torch.zeros(V, device="cuda")
+    for s in range(0, cache["face_id"].shape[0], chunk):
+        tri = mesh.faces[cache["face_id"][s:s + chunk].long()].long()
+        b = cache["bary"][s:s + chunk]
+        c = loss_space(cache["rgb"][s:s + chunk].float())
+        for k in range(3):
+            num.index_add_(0, tri[:, k], b[:, k:k + 1] * c)
+            den.index_add_(0, tri[:, k], b[:, k])
+    col = num / den.clamp_min(1e-6)[:, None]
+    d = (col[edges[:, 0]] - col[edges[:, 1]]).abs().max(-1).values
+    return torch.exp(-d / sigma)
+
+
+def sample_patches(cache, n: int, size: int):
+    """n random size x size patches (random view, centred on a random cached pixel of it). Returns the cache
+    rows of the valid patch pixels and their flat positions in the [n, size, size] patch stack."""
+    Vn, H, W = cache["index"].shape
+    rows = torch.randint(0, cache["face_id"].shape[0], (n,), device="cuda")
+    views = cache["cam"][rows].long()
+    # recover the anchor pixel coordinates of those rows
+    flat = torch.stack([(cache["index"][v] == r).nonzero()[0] for v, r in zip(views.tolist(), rows.tolist())])
+    y0 = (flat[:, 0] - size // 2).clamp(0, H - size)
+    x0 = (flat[:, 1] - size // 2).clamp(0, W - size)
+    ar = torch.arange(size, device="cuda")
+    ys = y0[:, None, None] + ar[None, :, None]
+    xs = x0[:, None, None] + ar[None, None, :]
+    rows_p = cache["index"][views[:, None, None], ys, xs]                          # [n, size, size]
+    valid = (rows_p >= 0).reshape(-1)
+    return rows_p.reshape(-1)[valid].long(), valid.nonzero()[:, 0]
+
+
+def patch_dssim(pred: torch.Tensor, gt: torch.Tensor, patch_idx: torch.Tensor) -> torch.Tensor:
+    """1 - SSIM over the patch stack; pixels outside the cache are zero in both images."""
+    from utils.loss_utils import ssim
+    shape = PATCH_SHAPE
+    P_ = torch.zeros(shape[0] * shape[1] * shape[2], 3, device=pred.device, dtype=pred.dtype)
+    G_ = torch.zeros_like(P_)
+    P_[patch_idx] = pred
+    G_[patch_idx] = gt
+    P_ = P_.reshape(*shape, 3).permute(0, 3, 1, 2)
+    G_ = G_.reshape(*shape, 3).permute(0, 3, 1, 2)
+    return 1 - ssim(P_, G_)
+
+
+PATCH_SHAPE = (32, 64, 64)
+
+
 def loss_space(x):
     return (x.clamp_min(0) + 1e-4) ** (1 / 2.2)
 
@@ -154,6 +214,34 @@ def render_view(mesh, mat, vis_packed, light, lut, cam, chunk=1 << 16, so=True, 
     return img
 
 
+_LPIPS = None
+
+
+def ssim_lpips(pred: torch.Tensor, gt: torch.Tensor) -> tuple[float, float]:
+    """Full-image SSIM and LPIPS (VGG) of display-space [H, W, 3] images in [0, 1]."""
+    global _LPIPS
+    from utils.loss_utils import ssim
+    if _LPIPS is None:
+        import lpips
+        _LPIPS = lpips.LPIPS(net="vgg", verbose=False).cuda().eval()
+    a, b = pred.clamp(0, 1).permute(2, 0, 1)[None], gt.clamp(0, 1).permute(2, 0, 1)[None]
+    return float(ssim(a, b)), float(_LPIPS(a * 2 - 1, b * 2 - 1))
+
+
+@torch.no_grad()
+def render_view_ss(mesh, mat, vis_packed, light, lut, cam, ss: int, **kw) -> dict:
+    """Antialiased render: ss x ss supersampling, box-filtered. Returns premultiplied 'rgb', 'albedo', 'rough'
+    and the pixel coverage 'alpha' (as the antialiased GT images, which are premultiplied by their alpha)."""
+    import dataclasses
+    big = dataclasses.replace(cam, width=cam.width * ss, height=cam.height * ss) if ss > 1 else cam
+    o = render_view(mesh, mat, vis_packed, light, lut, big, **kw)
+    m = o["mask"][..., None].float()
+    out = {"rgb": o["rgb"] * m, "albedo": o["albedo"] * m, "rough": o["rough"] * m, "alpha": m}
+    if ss > 1:
+        out = {k: F.avg_pool2d(v.permute(2, 0, 1)[None], ss)[0].permute(1, 2, 0) for k, v in out.items()}
+    return out
+
+
 def aligned_albedo_psnr(pred_lin, gt_lin, mask):
     p, g = pred_lin[mask], gt_lin[mask]
     scale = (p * g).sum(0) / (p * p).sum(0).clamp_min(1e-8)
@@ -164,14 +252,18 @@ def aligned_albedo_psnr(pred_lin, gt_lin, mask):
 
 @torch.no_grad()
 def evaluate(mesh, mat, vis_packed, lights, train_light, lut, ds, stride, img_dir: Path | None, n_vis=4, so=True,
-             indirect=None):
+             indirect=None, ss: int = 2):
+    """Masked metrics use the plain render; *_full metrics (InvRender/TensoIR/R3DG protocol) use an antialiased
+    ss x ss supersampled, premultiplied render against the (antialiased, premultiplied) GT."""
     rows = {k: [] for k in ("nvs_psnr_mask", "nvs_psnr_full", "albedo_psnr_aligned", "albedo_psnr_raw",
                             "rough_mse", *[f"relight_{e}_psnr_mask" for e in RELIGHT_ENVMAPS],
                             *[f"relight_{e}_psnr_full" for e in RELIGHT_ENVMAPS],
                             *[f"relight_{e}_psnr_mask_aligned" for e in RELIGHT_ENVMAPS],
                             # full-image variants (black background), the InvRender / TensoIR / R3DG protocol
                             "albedo_psnr_aligned_full", "rough_mse_full",
-                            *[f"relight_{e}_psnr_full_aligned" for e in RELIGHT_ENVMAPS])}
+                            *[f"relight_{e}_psnr_full_aligned" for e in RELIGHT_ENVMAPS],
+                            "nvs_ssim_full", "nvs_lpips_full", "albedo_ssim_full", "albedo_lpips_full",
+                            *[f"relight_{e}_{k}_full_aligned" for e in RELIGHT_ENVMAPS for k in ("ssim", "lpips")])}
     scales = []
     idx = list(range(0, ds.num_views("test"), stride))
     vis_idx = set(idx[:: max(1, len(idx) // n_vis)][:n_vis])
@@ -183,19 +275,27 @@ def evaluate(mesh, mat, vis_packed, lights, train_light, lut, ds, stride, img_di
         pred = tonemap(out["rgb"])
         gt = torch.from_numpy(tv.rgb).cuda()
         rows["nvs_psnr_mask"].append(psnr(pred, gt, mask))
-        rows["nvs_psnr_full"].append(psnr(pred * out["mask"][..., None], gt * gm[..., None]))
+        full = render_view_ss(mesh, mat, vis_packed, train_light, lut, tv.camera, ss, so=so, indirect=indirect)
+        pred_full = tonemap(full["rgb"])
+        rows["nvs_psnr_full"].append(psnr(pred_full, gt * gm[..., None]))
+        s_, l_ = ssim_lpips(pred_full, gt * gm[..., None])
+        rows["nvs_ssim_full"].append(s_)
+        rows["nvs_lpips_full"].append(l_)
         gt_alb = gamma_to_linear(torch.from_numpy(tv.albedo).cuda())
         a_al, a_raw, sc = aligned_albedo_psnr(out["albedo"], gt_alb, mask & out["mask"])
         rows["albedo_psnr_aligned"].append(a_al)
         sc_t = torch.tensor(sc, device="cuda")
         om = out["mask"][..., None].float()
-        rows["albedo_psnr_aligned_full"].append(psnr(tonemap((out["albedo"] * sc_t).clamp(0, 1)) * om,
-                                                     tonemap(gt_alb) * gm[..., None]))
+        alb_disp = (tonemap((full["albedo"] * sc_t).clamp(0, 1)), tonemap(gt_alb) * gm[..., None])
+        rows["albedo_psnr_aligned_full"].append(psnr(*alb_disp))
+        s_, l_ = ssim_lpips(*alb_disp)
+        rows["albedo_ssim_full"].append(s_)
+        rows["albedo_lpips_full"].append(l_)
         rows["albedo_psnr_raw"].append(a_raw)
         scales.append(sc)
         gt_r = torch.from_numpy(tv.rough).cuda()
         rows["rough_mse"].append(float(((out["rough"][..., 0] - gt_r)[mask & out["mask"]] ** 2).mean()))
-        rows["rough_mse_full"].append(float(((out["rough"][..., 0] * om[..., 0] - gt_r * gm) ** 2).mean()))
+        rows["rough_mse_full"].append(float(((full["rough"][..., 0] - gt_r * gm) ** 2).mean()))
         relit = {}
         for e in RELIGHT_ENVMAPS:
             o = render_view(mesh, mat, vis_packed, lights[e], lut, tv.camera, so=so, indirect=indirect)
@@ -203,13 +303,19 @@ def evaluate(mesh, mat, vis_packed, lights, train_light, lut, ds, stride, img_di
             g_rel, a_rel = torch.from_numpy(rgb).cuda(), torch.from_numpy(alpha).cuda()
             p_rel = tonemap(o["rgb"])
             rows[f"relight_{e}_psnr_mask"].append(psnr(p_rel, g_rel, a_rel > 0.5))
-            rows[f"relight_{e}_psnr_full"].append(psnr(p_rel * o["mask"][..., None], g_rel * a_rel[..., None]))
+            o_full = render_view_ss(mesh, mat, vis_packed, lights[e], lut, tv.camera, ss, so=so, indirect=indirect)
+            rows[f"relight_{e}_psnr_full"].append(psnr(tonemap(o_full["rgb"]), g_rel * a_rel[..., None]))
             relit[e] = (p_rel * o["mask"][..., None], g_rel * a_rel[..., None])
             o2 = render_view(mesh, mat, vis_packed, lights[e], lut, tv.camera, so=so,
                              albedo_scale=torch.tensor(sc, device="cuda"), indirect=indirect)
             rows[f"relight_{e}_psnr_mask_aligned"].append(psnr(tonemap(o2["rgb"]), g_rel, a_rel > 0.5))
-            rows[f"relight_{e}_psnr_full_aligned"].append(psnr(tonemap(o2["rgb"]) * o2["mask"][..., None],
-                                                               g_rel * a_rel[..., None]))
+            o2_full = render_view_ss(mesh, mat, vis_packed, lights[e], lut, tv.camera, ss, so=so, indirect=indirect,
+                                     albedo_scale=sc_t)
+            rel_disp = (tonemap(o2_full["rgb"]), g_rel * a_rel[..., None])
+            rows[f"relight_{e}_psnr_full_aligned"].append(psnr(*rel_disp))
+            s_, l_ = ssim_lpips(*rel_disp)
+            rows[f"relight_{e}_ssim_full_aligned"].append(s_)
+            rows[f"relight_{e}_lpips_full_aligned"].append(l_)
         if img_dir is not None and i in vis_idx:
             gray = lambda x: x.expand(*x.shape[:2], 3)
             top = torch.cat([gt * gm[..., None], pred * out["mask"][..., None],
@@ -252,6 +358,18 @@ def main():
     p.add_argument("--smooth-albedo", type=float, default=0.005)
     p.add_argument("--smooth-rough", type=float, default=0.02)
     p.add_argument("--learn-metallic", action="store_true")
+    p.add_argument("--learn-normals", action="store_true",
+                   help="learnable per-vertex shading-normal offset (exported as the glTF NORMAL attribute)")
+    p.add_argument("--smooth-normal", type=float, default=0.01, help="edge smoothness of the normal offset")
+    p.add_argument("--normal-anchor", type=float, default=0.01, help="|offset|^2 penalty (stay near geometry)")
+    p.add_argument("--lr-normal", type=float, default=1e-3)
+    p.add_argument("--ssim", type=float, default=0.0,
+                   help="weight of D-SSIM in the image loss (patch batches: --patches x --patch-size^2 pixels)")
+    p.add_argument("--patches", type=int, default=32)
+    p.add_argument("--patch-size", type=int, default=64)
+    p.add_argument("--edge-aware", type=float, default=0.0,
+                   help="sigma of image-edge-aware smoothness weights exp(-|dc|/sigma) on mesh edges "
+                        "(dc = difference of the vertices' mean observed colour); 0 = uniform")
     p.add_argument("--no-visibility", action="store_true", help="ablation: V = 1 above the horizon")
     p.add_argument("--vis-tmin", type=float, default=10.0,
                    help="shadow rays start this many median edge lengths away (skips local mesh noise)")
@@ -265,12 +383,15 @@ def main():
                    help="no diffuse attenuation by the specular layer (runs before 2026-11-15 Phase 5)")
     p.add_argument("--alpha-thr", type=float, default=0.99)
     p.add_argument("--eval-stride", type=int, default=4)
+    p.add_argument("--eval-ss", type=int, default=2, help="supersampling for the full-image (antialiased) metrics")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--eval-only", action="store_true", help="reload <out>/material.pt (+ light.pt) and re-evaluate")
     a = p.parse_args()
     global LAYERING
     LAYERING = not a.no_layering
     torch.manual_seed(a.seed)
+    global PATCH_SHAPE
+    PATCH_SHAPE = (a.patches, a.patch_size, a.patch_size)
     t0 = time.perf_counter()
 
     model = Path(a.model)
@@ -341,15 +462,22 @@ def main():
     else:
         alb0 = float(a.albedo_init)
     mat = PBRMaterial(mesh.faces, mesh.vertices.shape[0], face_res=a.face_res, albedo_init=alb0,
-                      learn_metallic=a.learn_metallic).cuda()
+                      learn_metallic=a.learn_metallic, learn_normals=a.learn_normals).cuda()
     params = [mat.albedo, mat.rough] + ([mat.metal] if a.learn_metallic else []) + \
              ([mat.residual] if mat.residual is not None else [])
     groups = [{"params": params, "lr": a.lr}]
+    if mat.normal_offset is not None:
+        groups.append({"params": [mat.normal_offset], "lr": a.lr_normal})
     if a.learn_light and light.log_env.requires_grad:
         groups.append({"params": [light.log_env], "lr": a.lr_light})
     opt = torch.optim.Adam(groups)
     sched = torch.optim.lr_scheduler.LambdaLR(opt, lambda it: a.lr_final_ratio ** (it / max(a.iters, 1)))
     edges = unique_edges(mesh.faces)
+    edge_w = None
+    if a.edge_aware > 0:
+        edge_w = edge_aware_weights(mesh, cache, edges, a.edge_aware)
+        print(f"[smooth] edge-aware weights sigma {a.edge_aware}: mean {float(edge_w.mean()):.3f}, "
+              f"share < 0.5: {float((edge_w < 0.5).float().mean()):.3f}")
 
     log = []
     if a.eval_only:
@@ -360,7 +488,10 @@ def main():
         prev = out_dir / "metrics.json"
         log = json.loads(prev.read_text()).get("train_log", []) if prev.is_file() else []
     for it in range(1, 0 if a.eval_only else a.iters + 1):
-        idx = torch.randint(0, P, (a.batch,), device="cuda")
+        if a.ssim > 0:                                    # patch batches (SSIM needs image structure)
+            idx, patch_idx = sample_patches(cache, a.patches, a.patch_size)
+        else:
+            idx = torch.randint(0, P, (a.batch,), device="cuda")
         fid, bary = cache["face_id"][idx].long(), cache["bary"][idx]
         cpos = cache["centers"][cache["cam"][idx].long()]
         if a.learn_light:
@@ -368,7 +499,11 @@ def main():
         e_ind = None if indirect is None else indirect.irradiance(mat, light, detach_material=not a.indirect_grad)
         o = shade_points(mesh, mat, vis_packed, light, lut, fid, bary, cpos, so=not a.no_so, e_ind=e_ind)
         l_img = (loss_space(o["rgb"]) - loss_space(cache["rgb"][idx].float())).abs().mean()
-        l_smooth = mat.edge_smoothness(edges, (a.smooth_albedo, a.smooth_rough))
+        if a.ssim > 0:
+            l_img = (1 - a.ssim) * l_img + a.ssim * patch_dssim(loss_space(o["rgb"]),
+                                                                 loss_space(cache["rgb"][idx].float()), patch_idx)
+        l_smooth = mat.edge_smoothness(edges, (a.smooth_albedo, a.smooth_rough), edge_w,
+                                       (a.smooth_normal, a.normal_anchor))
         loss = l_img + l_smooth
         if a.learn_light:
             loss = loss + a.light_tv * light.tv() + a.light_wb * light.white_balance()
@@ -403,7 +538,7 @@ def main():
     te = time.perf_counter()
     with torch.no_grad():
         metrics = evaluate(mesh, mat, vis_packed, lights, light, lut, ds, a.eval_stride, out_dir / "images",
-                           so=not a.no_so, indirect=indirect)
+                           so=not a.no_so, indirect=indirect, ss=a.eval_ss)
     metrics.update(light_metrics)
     metrics.update(seconds_total=time.perf_counter() - t0, seconds_eval=time.perf_counter() - te,
                    args=vars(a), occluded_share=float(occl), train_log=log)

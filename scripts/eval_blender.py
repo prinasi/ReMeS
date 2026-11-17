@@ -77,7 +77,9 @@ def main():
     if mat.residual is not None:                                  # per-face residual textures -> exact tiles
         face_tiles = mat.face_texel_values(4)
         face_tiles["albedo"] = np.clip(face_tiles["albedo"] * np.asarray(scale, np.float32), 0, 1)
-    rep = write_pbr_glb(mesh.vertices.cpu().numpy(), mesh.faces.cpu().numpy(), mesh.vertex_normals.cpu().numpy(),
+    with torch.no_grad():
+        shade_n = mat.shading_normals(mesh.vertex_normals)                 # learned normals if any (glTF NORMAL)
+    rep = write_pbr_glb(mesh.vertices.cpu().numpy(), mesh.faces.cpu().numpy(), shade_n.cpu().numpy(),
                         albedo.cpu().numpy(), v["rough"].cpu().numpy(), v["metal"].cpu().numpy(), glb,
                         tile_size=4, face_tiles=face_tiles)
     print(f"[export] {rep['faces']:,} faces, {rep['pages']} page(s), {rep['bytes'] / 1e6:.1f} MB, albedo scale {scale}")

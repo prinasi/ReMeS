@@ -25,7 +25,7 @@ def _logit(p: float) -> float:
 class PBRMaterial(nn.Module):
     def __init__(self, faces: torch.Tensor, num_vertices: int, face_res: int = 0,
                  albedo_init: float | torch.Tensor = 0.5, rough_init: float = 0.5,
-                 metal_init: float = 0.0, learn_metallic: bool = False):
+                 metal_init: float = 0.0, learn_metallic: bool = False, learn_normals: bool = False):
         super().__init__()
         self.register_buffer("faces", faces.long())
         dev = faces.device
@@ -44,6 +44,17 @@ class PBRMaterial(nn.Module):
             self.residual = nn.Parameter(torch.zeros(faces.shape[0], face_res, face_res, 5, device=dev))
         else:
             self.register_parameter("residual", None)
+        # learnable shading normals: per-vertex offset added to the geometric vertex normal (exported as NORMAL)
+        if learn_normals:
+            self.normal_offset = nn.Parameter(torch.zeros(num_vertices, 3, device=dev))
+        else:
+            self.register_parameter("normal_offset", None)
+
+    def shading_normals(self, vertex_normals: torch.Tensor) -> torch.Tensor:
+        """Per-vertex shading normals [V, 3]: geometric normals, plus the learned offset if enabled."""
+        if self.normal_offset is None:
+            return vertex_normals
+        return torch.nn.functional.normalize(vertex_normals + self.normal_offset, dim=-1)
 
     # ------------------------------------------------------------------ activations
     @staticmethod
@@ -110,12 +121,22 @@ class PBRMaterial(nn.Module):
         return {k: v.numpy() for k, v in out.items()}
 
     # ------------------------------------------------------------------ regularisers
-    def edge_smoothness(self, edges: torch.Tensor, weights=(1.0, 1.0)) -> torch.Tensor:
-        """Mean |Δ| of activated albedo / roughness across mesh edges [E, 2]."""
+    def edge_smoothness(self, edges: torch.Tensor, weights=(1.0, 1.0), edge_w: torch.Tensor | None = None,
+                        normal_weights=(0.0, 0.0)) -> torch.Tensor:
+        """Mean |Δ| of activated albedo / roughness across mesh edges [E, 2], optionally weighted per edge
+        (edge_w [E], e.g. image-edge-aware exp(-|Δc|/σ)). normal_weights = (smoothness of the learned normal
+        offset across edges, |offset|² magnitude penalty)."""
         v = self.vertex_values()
-        da = (v["albedo"][edges[:, 0]] - v["albedo"][edges[:, 1]]).abs().mean()
-        dr = (v["rough"][edges[:, 0]] - v["rough"][edges[:, 1]]).abs().mean()
-        return weights[0] * da + weights[1] * dr
+        w = edge_w[:, None] if edge_w is not None else 1.0
+        diff = lambda t: (t[edges[:, 0]] - t[edges[:, 1]]).reshape(edges.shape[0], -1).abs()
+        da = (w * diff(v["albedo"])).mean()
+        dr = (w * diff(v["rough"])).mean()
+        out = weights[0] * da + weights[1] * dr
+        if self.normal_offset is not None and any(normal_weights):
+            o = self.normal_offset
+            out = out + normal_weights[0] * (w * diff(o)).mean() \
+                + normal_weights[1] * (o ** 2).sum(-1).mean()
+        return out
 
 
 def unique_edges(faces: torch.Tensor) -> torch.Tensor:

@@ -24,7 +24,8 @@ def load_material(mesh, run_dir: Path) -> PBRMaterial:
     ck = torch.load(run_dir / "material.pt", map_location="cuda", weights_only=False)
     args = ck["args"]
     mat = PBRMaterial(mesh.faces, mesh.vertices.shape[0], face_res=args.get("face_res", 0),
-                      learn_metallic=args.get("learn_metallic", False)).cuda()
+                      learn_metallic=args.get("learn_metallic", False),
+                      learn_normals=args.get("learn_normals", False)).cuda()
     mat.load_state_dict(ck["state_dict"])
     return mat
 
@@ -54,7 +55,9 @@ def main():
         face_tiles = mat.face_texel_values(a.tile_size)
         if a.albedo_scale is not None:
             face_tiles["albedo"] = np.clip(face_tiles["albedo"] * np.asarray(a.albedo_scale, np.float32), 0, 1)
-    rep = write_pbr_glb(mesh.vertices.cpu().numpy(), mesh.faces.cpu().numpy(), mesh.vertex_normals.cpu().numpy(),
+    with torch.no_grad():
+        shade_n = mat.shading_normals(mesh.vertex_normals)                 # learned normals if any (glTF NORMAL)
+    rep = write_pbr_glb(mesh.vertices.cpu().numpy(), mesh.faces.cpu().numpy(), shade_n.cpu().numpy(),
                         albedo.cpu().numpy(), v["rough"].cpu().numpy(), v["metal"].cpu().numpy(), out,
                         tile_size=a.tile_size, atlas_size=a.atlas_size, face_tiles=face_tiles)
     print(f"[export] {rep['faces']:,} faces, {rep['pages']} atlas page(s), {rep['bytes'] / 1e6:.1f} MB -> {out}")
