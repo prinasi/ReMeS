@@ -29,7 +29,7 @@ from relight.envmap import downsample_envmap, load_envmap  # noqa: E402
 from relight.gbuffer import mvp_matrix  # noqa: E402
 from relight.io import tonemap, write_png  # noqa: E402
 from relight.mesh import FrozenMesh, save_relight_mesh  # noqa: E402
-from relight.oto import OpaqueSoup, albedo_smoothness, visual_hull_soup  # noqa: E402
+from relight.oto import OpaqueSoup, albedo_smoothness, flatness_loss, texture_weight, visual_hull_soup  # noqa: E402
 from relight.shadowmap import ShadowMapper, sample_directions  # noqa: E402
 from relight.shading import LearnableEnvLight, brdf_lut, fibonacci_sphere  # noqa: E402
 
@@ -103,6 +103,8 @@ def stage_b(a, soup, views, light, lut, light_opt, log, t0, mapper=None):
         l_img = (gamma(o["rgb"]) - gt).abs().mean()
         loss = l_img + a.lambda_mask * (o["alpha"] - m).abs().mean() + a.lambda_dn * cm_dn(o) \
             + a.lambda_lap * cm.laplacian_loss() + a.lambda_nc * cm.normal_consistency_loss()
+        if a.lambda_flat > 0:
+            loss = loss + a.lambda_flat * flatness_loss(o, cam, texture_weight(gt, a.flat_sigma))
         l_mv, _ = mv_term(a, o, views, vi, cm.verts, cm.faces, 1 << 30)       # always on in Stage B
         loss = loss + a.lambda_mv * l_mv + a.lambda_mvs * mvs_term(a, o, views, vi)
         if shadow is not None and a.lambda_albedo > 0:
@@ -197,6 +199,14 @@ def main():
     p.add_argument("--densify-every", type=int, default=500)
     p.add_argument("--cov-split", type=float, default=12.0, help="split if max pixel coverage exceeds this")
     p.add_argument("--cov-prune", type=float, default=1.0, help="prune if max pixel coverage is below this")
+    p.add_argument("--split-by", choices=["coverage", "error"], default="coverage",
+                   help="'error': split only large triangles whose mean image error exceeds --split-err x the mean "
+                        "(coverage-only splitting refines the front-most layer and domes textureless planes)")
+    p.add_argument("--split-err", type=float, default=1.0)
+    p.add_argument("--lambda-flat", type=float, default=0.0,
+                   help="texture-weighted planarity prior (screen-space 2nd differences of inverse depth); 0 = off")
+    p.add_argument("--flat-sigma", type=float, default=0.02, help="image-gradient scale of the texture weight")
+    p.add_argument("--flat-from", type=int, default=0)
     p.add_argument("--lr-pos", type=float, default=2e-4)
     p.add_argument("--lr-pos-final", type=float, default=2e-5)
     p.add_argument("--lr-color", type=float, default=1e-2)
@@ -331,9 +341,14 @@ def main():
         shadow = shadow_context(mapper, light, soup.verts.reshape(-1, 3), soup.faces(), a.shadow_dirs) \
             if soup.is_albedo else None
         o = soup.render(cam, light, lut, mvp=mvp, track_coverage=True, shadow=shadow, soft_edge_tau=a.soft_edge_tau)
-        l_img = (gamma(o["rgb"]) - gt).abs().mean()
+        res = (gamma(o["rgb"]) - gt).abs()
+        l_img = res.mean()
         l_mask = (o["alpha"] - m).abs().mean()
         loss = l_img + a.lambda_mask * l_mask
+        if a.split_by == "error":
+            soup.track_error(o, res.detach().mean(-1))
+        if a.lambda_flat > 0 and it >= a.flat_from:
+            loss = loss + a.lambda_flat * flatness_loss(o, cam, texture_weight(gt, a.flat_sigma))
         if shadow is not None and a.lambda_albedo > 0:
             loss = loss + a.lambda_albedo * albedo_smoothness(o, gt)
         l_dn = torch.zeros((), device="cuda")
@@ -355,7 +370,12 @@ def main():
             n_prune = soup.prune(soup.max_cov < a.cov_prune) if it >= 1000 else 0
             n_split = 0
             if it <= a.densify_until:
-                cand = (soup.max_cov > a.cov_split).nonzero()[:, 0]
+                big = soup.max_cov > a.cov_split
+                if a.split_by == "error":
+                    e = soup.mean_error()
+                    seen = soup.err_cnt > 0
+                    big &= seen & (e > a.split_err * e[seen].mean())
+                cand = big.nonzero()[:, 0]
                 cap = min(a.max_tris, a.max_tris_pbr) if soup.is_albedo else a.max_tris
                 room = max(0, cap - soup.num)
                 if cand.numel() > room:

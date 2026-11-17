@@ -56,6 +56,8 @@ class OpaqueSoup:
         self.lrs = {"verts": lr_pos, "diffuse": lr_color, "spec": lr_spec}
         self.opt = torch.optim.Adam([{"params": [getattr(self, n)], "lr": self.lrs[n], "name": n} for n in self.PARAMS])
         self.max_cov = torch.zeros(F_, device=dev)
+        self.err_sum = torch.zeros(F_, device=dev)                 # accumulated per-pixel image error
+        self.err_cnt = torch.zeros(F_, device=dev)
 
     @property
     def num(self) -> int:
@@ -83,6 +85,17 @@ class OpaqueSoup:
                 m = out["mask"]
                 self.max_cov = torch.maximum(self.max_cov, torch.bincount(out["tri"][m], minlength=self.num).float())
         return out
+
+    @torch.no_grad()
+    def track_error(self, out: dict, err: torch.Tensor):
+        """Accumulate the per-pixel image error err [H, W] onto the visible triangles."""
+        m = out["mask"]
+        t = out["tri"][m]
+        self.err_sum.index_add_(0, t, err[m].float())
+        self.err_cnt.index_add_(0, t, torch.ones_like(t, dtype=torch.float))
+
+    def mean_error(self) -> torch.Tensor:
+        return self.err_sum / self.err_cnt.clamp_min(1)
 
     # ------------------------------------------------------------------ priors
     @staticmethod
@@ -118,10 +131,11 @@ class OpaqueSoup:
                         t = torch.cat([t, torch.zeros_like(add)], 0)
                     st[k] = t
                 self.opt.state[q] = st
-        mc = self.max_cov[keep]
-        if new is not None:
-            mc = torch.cat([mc, torch.zeros(new["verts"].shape[0], device=mc.device)], 0)
-        self.max_cov = mc
+        for name in ("max_cov", "err_sum", "err_cnt"):
+            t = getattr(self, name)[keep]
+            if new is not None:
+                t = torch.cat([t, torch.zeros(new["verts"].shape[0], device=t.device)], 0)
+            setattr(self, name, t)
 
     @torch.no_grad()
     def prune(self, remove: torch.Tensor) -> int:
@@ -179,6 +193,8 @@ class OpaqueSoup:
 
     def reset_coverage(self):
         self.max_cov.zero_()
+        self.err_sum.zero_()
+        self.err_cnt.zero_()
 
     def step(self):
         self.opt.step()
@@ -556,3 +572,45 @@ def surface_soup(mesh, views, n_tris: int = 40_000, poisson_depth: int = 9, carv
     area = float(pm.face_areas.sum())
     r = size_factor * math.sqrt(area / n_tris)
     return spawn_triangles(pts, nrm, r, seed), {"poisson_faces": int(pm.faces.shape[0]), "area": area, "radius": r}
+
+
+def texture_weight(gt: torch.Tensor, sigma: float = 0.02) -> torch.Tensor:
+    """exp(-|grad I| / sigma) of a [H, W, 3] image (max over channels, 3x3 max-filtered): ~1 on textureless
+    regions, ~0 on texture / shading edges."""
+    g = gt.permute(2, 0, 1)[None]
+    gx = F.pad((g[..., :, 1:] - g[..., :, :-1]).abs(), (0, 1, 0, 0))
+    gy = F.pad((g[..., 1:, :] - g[..., :-1, :]).abs(), (0, 0, 0, 1))
+    mag = torch.maximum(gx, gy).amax(1, keepdim=True)
+    mag = F.max_pool2d(mag, 3, 1, 1)
+    return torch.exp(-mag / sigma)[0, 0]
+
+
+def flatness_loss(out: dict, cam, weight: torch.Tensor, strides=(8, 32, 64)) -> torch.Tensor:
+    """Texture-weighted screen-space second differences of inverse depth at several pixel strides (zero
+    exactly for planes under perspective; large strides see the low-frequency bending of a dome, which
+    one-pixel differences on a piecewise-planar mesh do not). With the silhouette fixing the boundary, the
+    minimiser over a textureless region is the plane spanning it. A triple (x-k, x, x+k) counts only if all
+    three pixels are covered and the image is textureless along it (weight min-pooled over the stride).
+    Occlusion boundaries are excluded only through the texture weight (they nearly always are image edges):
+    an explicit depth-discontinuity cutoff lets the optimiser escape the prior by creating steep kinks.
+    Squared (not L1): L1 of second differences is satisfied by a few sharp creases (a pyramid keeps the
+    dome's height); L2 spreads the bending and its minimiser with a fixed linear boundary is the plane."""
+    c2w = torch.as_tensor(cam.c2w, dtype=torch.float32, device=out["position"].device)
+    z = -((out["position"] - c2w[:3, 3]) @ c2w[:3, 2])                  # camera-space depth (OpenGL -z)
+    m = out["mask"]
+    d = 1.0 / z.clamp_min(1e-3)
+    wneg = -weight[None, None]
+    terms = []
+    for k in strides:
+        w = -F.max_pool2d(wneg, 2 * k + 1, 1, k)[0, 0]                   # min weight within the stride
+        for dim in (0, 1):
+            n = d.shape[dim]
+            if n <= 2 * k:
+                continue
+            sl = lambda t, a, b: t.narrow(dim, a, n - 2 * k) if b else t
+            a_, b_, c_ = sl(d, 0, 1), sl(d, k, 1), sl(d, 2 * k, 1)
+            valid = sl(m, 0, 1) & sl(m, k, 1) & sl(m, 2 * k, 1)
+            r = (a_ - 2 * b_ + c_).abs() / b_.clamp_min(1e-6)
+            if valid.any():
+                terms.append((sl(w, k, 1)[valid] * r[valid] ** 2).sum() / valid.sum())
+    return sum(terms) / max(len(terms), 1) if terms else d.new_zeros(())

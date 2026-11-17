@@ -560,3 +560,27 @@ open slab and contact region 4–8 dB worse).
 * ⇒ the open slab has no photometric or stereo depth evidence; what constrains it is the silhouette boundary
   plus a prior. Candidates: minimal-surface / planarity prior in low-texture regions (a dome has more area than
   the plane spanning the same boundary), or depth-neutral densification (split by image error, not coverage).
+
+#### Fix attempts (negative so far): error-driven splitting, planarity prior, MVS anchor
+
+New flags (off by default): `--split-by error [--split-err]` (split only large triangles whose mean image
+error is above average) and `--lambda-flat [--flat-sigma]` (texture-weighted multi-stride squared second
+differences of screen-space inverse depth, Stage A and B; `tests/test_flatness.py`: flattens a 15 cm dome on a
+fixed apron to < 1 mm). SynthGeo textured, T²-Splat init:
+
+| Variant | Acc | Normal | Slab | Obj depth |
+|---|---|---|---|---|
+| Stage A default | ≈0.04 | ≈3.1° | ≈−0.045 | ≈0.09 |
+| A: split by error | 0.067 | 3.9° | −0.029 | 0.095 |
+| A: flat 1 / 10 / 300 / 3000 | 0.041 / 0.046 / 0.118 / 1.313 | 3.0 / 3.0 / 3.6 / 12.3° | −0.047 / −0.044 / −0.033 / −0.232 | 0.088 / 0.086 / 0.122 / 0.90 |
+| A: split by error + flat 10 | 0.088 | 3.9° | −0.032 | 0.096 |
+| Stage B only (resume), no prior | 0.027 | 1.8° | −0.045 | 0.031 |
+| B: flat 300 / 3000 / 30000 | 0.046 / 0.223 / 0.395 | 2.1 / 5.5 / 8.8° | −0.051 / −0.054 / −0.056 | 0.069 / 0.52 / 0.90 |
+| B: MVS depth 0.5 | 0.032 | 1.8° | −0.043 | 0.058 |
+| B: MVS depth 0.5 + flat 300 | 0.039 | 1.9° | −0.050 | 0.069 |
+
+* The slab is **not a dome but a flat plateau** ≈ 3.7 cm above the GT top (interior z ≈ −0.643 vs −0.680) with a
+  rounded rim (≈ −0.67 at the edges) — a planarity prior has nothing to correct; in the soup (no connectivity)
+  a strong prior is satisfied by floating patches and lifts the slab further.
+* Neither the MVS depth term (rim / contact anchors) nor anchor + planarity moves the plateau in Stage B, so it
+  is actively held (not merely unconstrained). Next: per-loss-term gradient attribution on slab vertices.
