@@ -34,10 +34,30 @@ from relight.shadowmap import ShadowMapper, sample_directions  # noqa: E402
 from relight.shading import LearnableEnvLight, brdf_lut, fibonacci_sphere  # noqa: E402
 
 SKIP_TOP_ROWS = 5
+MVS_DEPTHS: list = []          # per-view MVS depth maps (--mvs-depth), kept out of the saved args
 
 
 def gamma(x):
     return (x.clamp_min(0) + 1e-4) ** (1 / 2.2)
+
+
+def mvs_term(a, o, views, vi):
+    """MVS depth prior (relight/multiview.mvs_depth_loss) for view vi; 0 when off."""
+    if a.lambda_mvs <= 0 or MVS_DEPTHS[vi] is None:
+        return torch.zeros((), device="cuda")
+    from relight.multiview import mvs_depth_loss
+    cam, m, _, _ = views[vi]
+    return mvs_depth_loss(o, cam, MVS_DEPTHS[vi], m, a.mvs_trunc)[0]
+
+
+def mv_term(a, o, views, vi, V, faces, it):
+    """Multi-view NCC (relight/multiview.py) against a random neighbour of view vi; 0 when off."""
+    if a.lambda_mv <= 0 or it < a.mv_from:
+        return torch.zeros((), device="cuda"), None
+    from relight.multiview import ncc_loss
+    cam, m, gt, _ = views[vi]
+    nc, nm, ngt, _ = views[random.choice(a.mv_nbrs[vi])]
+    return ncc_loss(o, gt, m, nc, ngt, nm, V, faces, patch=a.mv_patch, tex_thr=a.mv_tex_thr)
 
 
 def stage_b(a, soup, views, light, lut, light_opt, log, t0, mapper=None):
@@ -73,7 +93,8 @@ def stage_b(a, soup, views, light, lut, light_opt, log, t0, mapper=None):
             print(f"[B {it - 1:5d}] remesh: target edge {info['target_len']:.4f}, V/F {info['before']} -> "
                   f"{info['after']}", flush=True)
         cm.set_lr("verts", a.lr_pos_b * 0.1 ** (it / a.stage_b_iters))
-        cam, m, gt, mvp = random.choice(views)
+        vi = random.randrange(len(views))
+        cam, m, gt, mvp = views[vi]
         if light is not None:
             light.refresh()
         shadow = shadow_context(mapper, light, cm.verts, cm.faces, a.shadow_dirs) \
@@ -82,6 +103,8 @@ def stage_b(a, soup, views, light, lut, light_opt, log, t0, mapper=None):
         l_img = (gamma(o["rgb"]) - gt).abs().mean()
         loss = l_img + a.lambda_mask * (o["alpha"] - m).abs().mean() + a.lambda_dn * cm_dn(o) \
             + a.lambda_lap * cm.laplacian_loss() + a.lambda_nc * cm.normal_consistency_loss()
+        l_mv, _ = mv_term(a, o, views, vi, cm.verts, cm.faces, 1 << 30)       # always on in Stage B
+        loss = loss + a.lambda_mv * l_mv + a.lambda_mvs * mvs_term(a, o, views, vi)
         if shadow is not None and a.lambda_albedo > 0:
             loss = loss + a.lambda_albedo * albedo_smoothness(o, gt)
         if light is not None and a.env_tv > 0 and light.log_env.requires_grad:
@@ -185,6 +208,15 @@ def main():
     p.add_argument("--no-specular", action="store_true", help="ablation: diffuse only")
     p.add_argument("--lambda-mask", type=float, default=0.1)
     p.add_argument("--lambda-dn", type=float, default=0.05, help="normal-depth consistency weight")
+    p.add_argument("--lambda-mv", type=float, default=0.0,
+                   help="multi-view patch-NCC consistency weight (relight/multiview.py; 0 = off)")
+    p.add_argument("--mvs-depth", default="", help="COLMAP dense workspace (scripts/mvs_init.py <out>/colmap/dense)")
+    p.add_argument("--lambda-mvs", type=float, default=0.0, help="truncated MVS depth prior weight (0 = off)")
+    p.add_argument("--mvs-trunc", type=float, default=0.02, help="relative residual above which MVS depth is ignored")
+    p.add_argument("--mv-from", type=int, default=3000, help="Stage A iteration where the NCC term starts")
+    p.add_argument("--mv-patch", type=int, default=7)
+    p.add_argument("--mv-neighbours", type=int, default=4)
+    p.add_argument("--mv-tex-thr", type=float, default=0.01, help="min reference patch std (gamma units)")
     p.add_argument("--pbr-from", type=int, default=4000,
                    help="switch diffuse from free radiance to albedo x shadowed irradiance at this iteration (-1 = never)")
     p.add_argument("--shadow-dirs", type=int, default=32,
@@ -234,6 +266,14 @@ def main():
         gt = gamma(torch.from_numpy(v.linear).cuda() * m[..., None])
         views.append((v.camera, m, gt, mvp_matrix(v.camera).cuda()))
     print(f"[data] {len(views)} train views", flush=True)
+    if a.lambda_mvs > 0:
+        from relight.multiview import load_mvs_depths
+        MVS_DEPTHS[:] = load_mvs_depths(a.mvs_depth, len(views))
+        cov = [float((d > 0).float().mean()) for d in MVS_DEPTHS if d is not None]
+        print(f"[mvs] {len(cov)} depth maps from {a.mvs_depth}, mean coverage {np.mean(cov):.3f}", flush=True)
+    if a.lambda_mv > 0:
+        from relight.multiview import neighbour_table
+        a.mv_nbrs = neighbour_table([v[0] for v in views], k=a.mv_neighbours)
 
     if a.resume:
         st = torch.load(Path(a.resume) / "soup.pt")
@@ -279,7 +319,8 @@ def main():
     for it in range(1, 0 if a.resume else a.iters + 1):
         frac = it / a.iters
         soup.set_lr("verts", a.lr_pos * (a.lr_pos_final / a.lr_pos) ** frac)
-        cam, m, gt, mvp = random.choice(views)
+        vi = random.randrange(len(views))
+        cam, m, gt, mvp = views[vi]
         if light is not None:
             light.refresh()
         if light is not None and a.pbr_from >= 0 and it == a.pbr_from and not soup.is_albedo:
@@ -299,6 +340,8 @@ def main():
         if a.lambda_dn > 0 and it >= a.dn_from:
             l_dn = soup.depth_normal_loss(o)
             loss = loss + a.lambda_dn * l_dn
+        l_mv, mv_info = mv_term(a, o, views, vi, soup.verts.reshape(-1, 3), soup.faces(), it)
+        loss = loss + a.lambda_mv * l_mv + a.lambda_mvs * mvs_term(a, o, views, vi)
         if light is not None and a.env_tv > 0 and light.log_env.requires_grad:
             loss = loss + a.env_tv * light.tv()
         loss.backward()
@@ -322,10 +365,12 @@ def main():
             with torch.no_grad():
                 psnr = -10 * math.log10(((gamma(o["rgb"]) - gt) ** 2).mean().item())
             rec = {"iter": it, "tris": soup.num, "pruned": n_prune, "split": n_split, "L1": l_img.item(),
-                   "mask": l_mask.item(), "dn": float(l_dn), "psnr": psnr}
+                   "mask": l_mask.item(), "dn": float(l_dn), "psnr": psnr,
+                   "ncc": mv_info["ncc"] if mv_info else None}
             log.append(rec)
             print(f"[{it:6d}] tris {soup.num:>8,} (-{n_prune:,} +{n_split:,})  L1 {l_img.item():.4f}  "
-                  f"mask {l_mask.item():.4f}  dn {float(l_dn):.4f}  PSNR {psnr:.2f}  ({time.perf_counter() - t0:.0f}s)",
+                  f"mask {l_mask.item():.4f}  dn {float(l_dn):.4f}  "
+                  f"{'ncc %.3f  ' % mv_info['ncc'] if mv_info else ''}PSNR {psnr:.2f}  ({time.perf_counter() - t0:.0f}s)",
                   flush=True)
 
     # final cleanup: drop triangles never visible in a full pass over the training views

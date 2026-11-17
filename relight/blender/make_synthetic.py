@@ -13,6 +13,11 @@ The slab material is the same in all variants.
 
 Writes train/{i}_rgb.exr (linear, black background) + {i}_mask.png, test/{i}_rgba.png
 (16-bit, gamma 2.2), transforms_{train,test}.json and gt_mesh.ply (world-space, evaluated).
+
+--extras adds the Synthetic4Relight material / relighting ground truth at the existing test cameras
+(also on an already generated scene with --extras-only): test/{i}_albedo.png (base colour, gamma
+1/2.2), test/{i}_rough.png (linear) and test_rli/{envmap}_{i}.png (16-bit, gamma 2.2) under the
+relighting envmaps found next to --envmap.
 """
 from __future__ import annotations
 
@@ -78,6 +83,72 @@ def build_scene(material: str):
     return [obj, slab]
 
 
+def _emission_override(objs, what: str):
+    """Replace every object's material output by an emission of its base colour / roughness."""
+    for o in objs:
+        for mat in o.data.materials:
+            nt = mat.node_tree
+            bsdf = next(n for n in nt.nodes if n.type == "BSDF_PRINCIPLED")
+            out = next(n for n in nt.nodes if n.type == "OUTPUT_MATERIAL")
+            em = nt.nodes.new("ShaderNodeEmission")
+            em.inputs["Strength"].default_value = 1.0
+            src = bsdf.inputs["Base Color" if what == "albedo" else "Roughness"]
+            if src.is_linked:
+                nt.links.new(src.links[0].from_socket, em.inputs["Color"])
+            elif what == "albedo":
+                em.inputs["Color"].default_value = tuple(src.default_value)
+            else:
+                r = float(src.default_value)
+                em.inputs["Color"].default_value = (r, r, r, 1.0)
+            nt.links.new(em.outputs["Emission"], out.inputs["Surface"])
+
+
+def _render_rgba(scene, tmp: Path):
+    output_exr(scene, str(tmp))
+    scene.render.image_settings.color_mode = "RGBA"
+    bpy.ops.render.render(write_still=True)
+    img = cv2.imread(str(tmp), cv2.IMREAD_UNCHANGED)          # BGRA, premultiplied, linear
+    tmp.unlink()
+    alpha = np.clip(img[..., 3], 0, 1)
+    return img[..., :3] / np.maximum(alpha[..., None], 1e-6), alpha
+
+
+def _write_png16(path, rgb, alpha):
+    rgba = np.concatenate([np.clip(rgb, 0, 1), alpha[..., None]], -1)
+    cv2.imwrite(str(path), np.round(rgba * 65535).astype(np.uint16))
+
+
+def render_extras(out: Path, envmap: str, samples: int, device: str, material: str):
+    """Test-view GT albedo / roughness and relit images (Synthetic4Relight layout)."""
+    meta = json.loads((out / "transforms_test.json").read_text())
+    names = [Path(f["file_path"]).name for f in meta["frames"]]
+    env_dir = Path(envmap).parent
+    (out / "test_rli").mkdir(exist_ok=True)
+    for kind in ("envmap6", "envmap12", "albedo", "rough"):
+        scene = reset_scene()
+        setup_cycles(scene, samples=samples if kind.startswith("envmap") else 16, device=device)
+        scene.render.film_transparent = True
+        if kind.startswith("envmap"):
+            scene.cycles.use_denoising = True
+            setup_world_envmap(scene, str(env_dir / f"{kind}.exr"))
+        else:
+            setup_world_envmap(scene, envmap, strength=0.0)
+            scene.view_settings.view_transform = "Standard"
+        objs = build_scene(material)
+        if not kind.startswith("envmap"):
+            _emission_override(objs, kind)
+        cam = add_camera(scene, meta["frames"][0]["transform_matrix"], meta["camera_angle_x"], name="cam_extra")
+        for i, (fr, name) in enumerate(zip(meta["frames"], names)):
+            cam.matrix_world = Matrix([list(map(float, r)) for r in fr["transform_matrix"]])
+            rgb, alpha = _render_rgba(scene, out / "test" / f"_tmp_{kind}_{i:03d}.exr")
+            if kind != "rough":                                      # roughness stays linear
+                rgb = np.clip(rgb, 0, None) ** (1 / 2.2)
+            dst = out / "test_rli" / f"{kind}_{name}.png" if kind.startswith("envmap") else \
+                out / "test" / f"{name}_{kind}.png"
+            _write_png16(dst, rgb, alpha)
+        print(f"[make_synthetic] extras {kind}: {len(names)} views", flush=True)
+
+
 def export_gt_mesh(objs, path: Path):
     dg = bpy.context.evaluated_depsgraph_get()
     verts, faces, off = [], [], 0
@@ -108,7 +179,12 @@ def main(argv=None):
     p.add_argument("--n-test", type=int, default=50)
     p.add_argument("--samples", type=int, default=128)
     p.add_argument("--device", default="auto")
+    p.add_argument("--extras", action="store_true", help="also render GT albedo / roughness / relit test views")
+    p.add_argument("--extras-only", action="store_true", help="only the extras, on an existing scene dir")
     a = p.parse_args(argv)
+    if a.extras_only:
+        render_extras(Path(a.out), a.envmap, a.samples, a.device, a.material)
+        return
     out, src = Path(a.out), Path(a.cameras)
     (out / "train").mkdir(parents=True, exist_ok=True)
     (out / "test").mkdir(parents=True, exist_ok=True)
@@ -150,6 +226,8 @@ def main(argv=None):
             {"camera_angle_x": meta["camera_angle_x"], "frames": out_frames}, indent=1))
     (out / "scene.json").write_text(json.dumps({"material": a.material, "gt_vertices": nv, "gt_faces": nf,
                                                 "envmap": a.envmap, "cameras_from": str(src)}, indent=2))
+    if a.extras:
+        render_extras(out, a.envmap, a.samples, a.device, a.material)
 
 
 if __name__ == "__main__":
