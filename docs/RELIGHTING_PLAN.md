@@ -697,3 +697,16 @@ Four scenes, learned light (env.pt init, lr 5e-3), v6 geometry:
 
 LPIPS is driven by appearance resolution (per-face textures), NVS PSNR / roughness by shading normals;
 edge-aware smoothness does not help.
+
+Combinations (same setting):
+
+| | NVS PSNR / SSIM / LPIPS | Relight PSNR / SSIM / LPIPS | Albedo PSNR / SSIM / LPIPS | Rough MSE |
+|---|---|---|---|---|
+| face 4 + normals | 34.45 / 0.973 / 0.051 | 33.85 / 0.968 / 0.063 | 29.36 / 0.948 / 0.073 | 0.0108 |
+| **face 4 + normals + SSIM 0.2** | 34.37 / 0.975 / 0.049 | 33.91 / 0.969 / 0.063 | 29.44 / 0.949 / 0.071 | 0.0105 |
+| face 8 + normals + SSIM 0.2 | 34.30 / 0.974 / 0.050 | 33.83 / 0.968 / 0.062 | 29.36 / 0.948 / 0.076 | 0.0091 |
+
+Recommended Phase 3 setting (now in `oto_real.sh` with `LEARN_LIGHT=1`): `--learn-light --lr-light 5e-3
+--face-res 4 --learn-normals --ssim 0.2` (indirect and env.pt light init are defaults). Versus R3DG:
+relighting +2.9 dB PSNR (SSIM higher), albedo +1.1 dB, roughness MSE 0.0105 vs 0.013; remaining gaps are
+NVS (−2.4 dB PSNR, LPIPS 0.049 vs 0.028) and LPIPS in general (relight 0.063 vs 0.050, albedo 0.071 vs 0.058).
