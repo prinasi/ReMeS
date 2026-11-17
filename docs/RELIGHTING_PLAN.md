@@ -710,3 +710,25 @@ Recommended Phase 3 setting (now in `oto_real.sh` with `LEARN_LIGHT=1`): `--lear
 --face-res 4 --learn-normals --ssim 0.2` (indirect and env.pt light init are defaults). Versus R3DG:
 relighting +2.9 dB PSNR (SSIM higher), albedo +1.1 dB, roughness MSE 0.0105 vs 0.013; remaining gaps are
 NVS (−2.4 dB PSNR, LPIPS 0.049 vs 0.028) and LPIPS in general (relight 0.063 vs 0.050, albedo 0.071 vs 0.058).
+
+### NVS error attribution → silhouette refinement (v8)
+
+`scripts/nvs_error_attribution.py` splits the full-image (antialiased) NVS error by region. On the best v6 run,
+a 2-px band around the GT silhouette (2–3 % of the pixels) holds **40–63 %** of the error, and 53–85 % of that
+is coverage: with the GT coverage the NVS PSNR would be 1.5–2.3 dB higher. Specular + concave interiors
+(the physics we do not model, e.g. specular interreflection) hold only 9–28 %. A Blackman–Harris 1.5 px
+reconstruction filter instead of box supersampling changes NVS by only +0.06 / +0.18 dB, so the error is
+geometric. (Chair: bright blotches on the thin backrest are not a visibility-offset issue; `--vis-tmin 2`
+changes nothing.)
+
+`scripts/refine_silhouette.py`: vertex displacement of the final mesh against the soft GT masks of all
+training views (nvdiffrast antialiased coverage, L2) with a Laplacian on the displacement and a small anchor;
+≈ 20 s per scene; test-view mask IoU 0.987–0.991 → 0.995–0.999. Now part of `oto_real.sh`
+(`NO_SILHOUETTE=1` to skip). Best Phase 3 setting on the refined meshes (4 scenes, learned light):
+
+| | NVS PSNR / SSIM / LPIPS | Relight PSNR / SSIM / LPIPS | Albedo PSNR / SSIM / LPIPS | Rough MSE |
+|---|---|---|---|---|
+| R3DG | 36.80 / 0.982 / 0.028 | 31.00 / 0.964 / 0.050 | 28.31 / 0.951 / 0.058 | 0.0130 |
+| v6 | 34.37 / 0.975 / 0.049 | 33.91 / 0.969 / 0.063 | 29.44 / 0.949 / 0.071 | 0.0105 |
+| **v8 (silhouette-refined)** | **35.94 / 0.979 / 0.045** | **34.47 / 0.972 / 0.059** | **29.98 / 0.952 / 0.068** | **0.0104** |
+| v8, 2× iterations / lr | 35.97 / 0.979 / 0.045 | 34.43 / 0.972 / 0.059 | 29.95 / 0.952 / 0.068 | 0.0104 |
