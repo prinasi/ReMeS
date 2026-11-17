@@ -3,7 +3,8 @@
 For each relighting envmap (envmap6, envmap12) the GLB is rendered with Cycles at the
 test cameras, (a) with full global illumination and (b) direct light only. Reports
   * round trip : IoU of Cycles alpha vs the ReMeS rasterised mask (geometry/axes);
-  * parity     : Cycles direct-only vs the ReMeS renderer (same light, same asset);
+  * parity     : Cycles direct-only vs the ReMeS renderer (same light, same asset; ReMeS direct only,
+                 also for Phase 4 runs, whose one-bounce term is used for "ReMeS vs GT");
   * engine     : Cycles GI vs ground-truth test_rli (the end-to-end metric), next to
                  the ReMeS renderer vs ground truth on the same views.
 Albedo is exported with the run's mean per-channel albedo alignment (metrics.json),
@@ -86,6 +87,11 @@ def main():
     h = median_edge_length(mesh)
     vis = cached_vertex_visibility(mesh, dirs, model / f"visibility_K{args['dirs']}_t{args['vis_tmin']:g}.pt",
                                    eps=0.5 * h, tmin=args["vis_tmin"] * h)
+    indirect = None
+    if args.get("indirect"):                                     # Phase 4 run: ReMeS-vs-GT includes the bounce light
+        from relight.indirect import IndirectLight
+        indirect = IndirectLight.cached(mesh, vis, dirs, model / f"indirect_K{args['dirs']}_t{args['vis_tmin']:g}.pt",
+                                        eps=0.5 * h, tmin=args["vis_tmin"] * h)
     lut = brdf_lut()
     frames = list(range(0, ds.num_views("test"), a.frame_stride))
     cams = ds.cameras("test")
@@ -101,7 +107,11 @@ def main():
         for k, f in enumerate(frames):
             gi = torch.from_numpy(read_image(dirs_out["gi"] / f"{f:03d}.exr")).cuda()
             di = torch.from_numpy(read_image(dirs_out["direct"] / f"{f:03d}.exr")).cuda()
-            ours = render_view(mesh, mat, vis, light, lut, cams[f], albedo_scale=torch.tensor(scale, device="cuda"))
+            sc_t = torch.tensor(scale, device="cuda")
+            with torch.no_grad():
+                ours = render_view(mesh, mat, vis, light, lut, cams[f], albedo_scale=sc_t)  # direct only (parity)
+                full = ours if indirect is None else render_view(mesh, mat, vis, light, lut, cams[f],
+                                                                 albedo_scale=sc_t, indirect=indirect)
             om = ours["mask"]
             cm = gi[..., 3] > 0.5
             stats["mask_iou"].append(float((om & cm).sum() / (om | cm).sum()))
@@ -114,7 +124,7 @@ def main():
             gi_disp = tonemap(gi[..., :3])
             stats["cycles_gi_vs_gt_mask"].append(psnr(gi_disp, g, gmask))
             stats["cycles_gi_vs_gt_full"].append(psnr(gi_disp, g * ga[..., None]))
-            stats["remes_vs_gt_mask"].append(psnr(o_disp, g, gmask))
+            stats["remes_vs_gt_mask"].append(psnr(tonemap(full["rgb"]) * full["mask"][..., None], g, gmask))
             stats["cycles_direct_vs_gt_mask"].append(psnr(tonemap(di[..., :3]), g, gmask))
             if k < 2:
                 write_png(run / "blender" / f"cmp_{e}_{f:03d}.png",

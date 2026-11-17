@@ -60,7 +60,7 @@ class FlatnessTest(unittest.TestCase):
 
     def test_descent_flattens(self):
         V, F_ = self.grid(0.15)
-        h0 = float(V[:, 2].max())
+        h0 = float(V[self.free, 2].abs().mean())
         V = V.clone().requires_grad_(True)
         opt = torch.optim.Adam([V], lr=2e-3)
         for _ in range(300):
@@ -68,4 +68,6 @@ class FlatnessTest(unittest.TestCase):
             self.loss(V, F_, self.cams).backward()
             V.grad[~self.free] = 0
             opt.step()
-        self.assertLess(float(V[:, 2].max()), 0.3 * h0)
+        # mean height of the free region (robust: nvdiffrast's backward uses atomics, so single vertices can
+        # end as small spikes from run to run)
+        self.assertLess(float(V[self.free, 2].abs().mean()), 0.1 * h0)

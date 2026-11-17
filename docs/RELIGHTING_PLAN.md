@@ -584,3 +584,48 @@ fixed apron to < 1 mm). SynthGeo textured, T²-Splat init:
   a strong prior is satisfied by floating patches and lifts the slab further.
 * Neither the MVS depth term (rim / contact anchors) nor anchor + planarity moves the plateau in Stage B, so it
   is actively held (not merely unconstrained). Next: per-loss-term gradient attribution on slab vertices.
+
+#### Gradient diagnostic: the slab plateau height is unobservable
+
+`train_oto.py --grad-diag <prefix>` saves per-loss-term vertex gradients summed over all training views at the
+start / end of Stage B; `scripts/grad_diag_report.py` splits them by region (open slab, contact, rim, object)
+and by path (shadow occluders / receivers, shading normals, raster) — SynthGeo, T²-Splat init:
+
+* Open slab (offset +0.047): the summed gradient points down but is incoherent — mean / rms of −g_z is
+  −0.03 (textured) and −0.001 (glossy); ≈ 50 % of vertices are pushed each way. Shading normals carry
+  55–76 % of the magnitude with near-random sign; on glossy, shadow receivers (+0.34) and occluders (−0.40)
+  cancel. After 5000 Stage-B iterations the offset moved from +0.0476 to +0.0471.
+* ⇒ the height of a textureless plane is (nearly) a gauge freedom of the photometric loss: whatever Stage A
+  leaves there stays. Smoothness-preconditioned "large steps" (Nicolet et al. 2021, `--large-steps λ`,
+  `relight/largesteps.py`, CG solves, uniform Adam) cannot amplify a force that is absent:
+
+| Stage B only | Slab | Acc | Normal | Obj depth |
+|---|---|---|---|---|
+| Adam (textured / glossy) | −0.045 / −0.047 | 0.027 / 0.075 | 1.8 / 2.3° | 0.031 / 0.128 |
+| large steps λ=19 | −0.045 / −0.047 | 0.036 / 0.079 | 2.1 / 2.4° | 0.041 / 0.174 |
+| large steps λ=100 | −0.047 / −0.048 | 0.037 / 0.079 | 2.1 / 2.5° | 0.042 / 0.176 |
+
+* What does fix it: an init that is right on the plane plus no coverage-driven splitting (MVS init, no split:
+  −0.005). A general fix needs an explicit height cue (slab-rim crease / side-face silhouettes) or a learned
+  depth prior (option 3).
+
+### Phase 4 — one-bounce indirect diffuse (done, `train_pbr.py --indirect`)
+
+`relight/indirect.py`: for every vertex and every *blocked* visibility direction above its tangent plane, one
+closest-hit ray (same offsets as the visibility rays) → hit triangle + barycentrics; a sparse transport matrix
+M[v, j] = Σ cos·ΔΩ·bary_j (built in < 2 s, ≈ 15 M non-zeros at 100 k vertices, cached next to the mesh).
+Per iteration E_ind = M · B with radiosity B = (1−metal)·albedo/π·E_dir (one sparse mat-mul; differentiable
+w.r.t. the light, and w.r.t. the hit albedo with `--indirect-grad`; default detached). `shade(..., irr_extra)`
+adds it to the diffuse irradiance in training, evaluation and relighting; the data-driven albedo init does one
+fixed-point step with it. `tests/test_indirect.py`: wall-foot analytic case (E_ind/E_dir = a/2) within 5 %.
+Blender parity stays direct-vs-direct; "ReMeS vs GT" uses the bounce term.
+
+Four scenes, v6 geometry, oracle light (means):
+
+| | Albedo raw / aligned | Rough MSE | Relight env6 / env12 full | ReMeS vs GT env6 / env12 | Cycles GI vs GT env6 / env12 |
+|---|---|---|---|---|---|
+| direct only | 22.85 / 24.44 | 0.0609 | 27.95 / 34.38 | 26.37 / 26.26 | 26.98 / 27.19 |
+| **+ indirect** | **23.65 / 24.80** | **0.0582** | **28.36 / 34.95** | **27.20 / 27.32** | **27.29 / 27.57** |
+
+Largest gains on hotdog / air_baloons (raw albedo ≈ +1 dB). The ReMeS renderer is now within 0.1–0.25 dB of
+Cycles with full GI. Recommended: `--indirect` for all material fits.

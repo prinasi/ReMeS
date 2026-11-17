@@ -374,6 +374,15 @@ class ConnectedMesh:
                                      {"params": [self.spec], "lr": lr_spec, "name": "spec"}])
         self._edges()
         self.max_cov = torch.zeros(self.faces.shape[0], device=V.device)
+        self.large = None
+
+    def enable_large_steps(self, lam: float, lr: float):
+        """Optimise vertex positions with relight/largesteps.py (smoothness-preconditioned, uniform Adam)
+        instead of per-coordinate Adam."""
+        from relight.largesteps import LargeSteps
+        self.large = LargeSteps(self.verts.shape[0], self.edges, lam=lam, lr=lr)
+        groups = [g for g in self.opt.param_groups if g["name"] != "verts"]
+        self.opt = torch.optim.Adam([{"params": g["params"], "lr": g["lr"], "name": g["name"]} for g in groups])
 
     def _edges(self):
         f = self.faces.long()
@@ -442,9 +451,12 @@ class ConnectedMesh:
         self.verts = Vn.clone().requires_grad_(True)
         self.diffuse = A[:, :3].clone().requires_grad_(True)
         self.spec = A[:, 3:].clone().requires_grad_(True)
-        self.opt = torch.optim.Adam([{"params": [getattr(self, n)], "lr": lrs[n], "name": n} for n in self.PARAMS])
+        self.opt = torch.optim.Adam([{"params": [getattr(self, n)], "lr": lrs[n], "name": n} for n in self.PARAMS
+                                     if n in lrs])
         self._edges()
         self.max_cov = torch.zeros(self.faces.shape[0], device=V.device)
+        if self.large is not None:
+            self.enable_large_steps(self.large.lam, self.large.lr)
         return {"target_len": target, "before": before, "after": (Vn.shape[0], Fn.shape[0])}
 
     @torch.no_grad()
@@ -453,13 +465,20 @@ class ConnectedMesh:
             self.faces = self.faces[~remove].contiguous()
             self.max_cov = self.max_cov[~remove]
             self._edges()
+            if self.large is not None:
+                self.enable_large_steps(self.large.lam, self.large.lr)
         return int(remove.sum())
 
     def step(self):
+        if self.large is not None:
+            self.large.step(self.verts)
         self.opt.step()
         self.opt.zero_grad(set_to_none=True)
 
     def set_lr(self, name, lr):
+        if name == "verts" and self.large is not None:
+            self.large.lr = lr
+            return
         for g in self.opt.param_groups:
             if g["name"] == name:
                 g["lr"] = lr

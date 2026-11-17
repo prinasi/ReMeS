@@ -44,6 +44,7 @@ from relight.mesh import load_relight_mesh  # noqa: E402
 from relight.shading import EnvLight, LearnableEnvLight, brdf_lut, fibonacci_sphere, shade  # noqa: E402
 from relight.envmap import downsample_envmap  # noqa: E402
 from relight.visibility import cached_vertex_visibility, interpolate_visibility  # noqa: E402
+from relight.indirect import interpolate_vertex  # noqa: E402
 
 SKIP_TOP_ROWS = 5   # hotdog train EXRs have their top rows zeroed (dataset artifact)
 
@@ -78,7 +79,7 @@ def build_pixel_cache(mesh, ds: Synthetic4Relight, alpha_thr: float) -> dict:
 LAYERING = True   # set from --no-layering in main()
 
 
-def shade_points(mesh, mat, vis_packed, light, lut, face_id, bary, cam_pos, so=True, albedo_scale=None):
+def shade_points(mesh, mat, vis_packed, light, lut, face_id, bary, cam_pos, so=True, albedo_scale=None, e_ind=None):
     n = shading_normal(mesh, face_id, bary)
     x = surface_point(mesh, face_id, bary)
     v = F.normalize(cam_pos - x, dim=-1)
@@ -86,14 +87,15 @@ def shade_points(mesh, mat, vis_packed, light, lut, face_id, bary, cam_pos, so=T
     if albedo_scale is not None:
         m["albedo"] = (m["albedo"] * albedo_scale).clamp(0, 1)
     vis = interpolate_visibility(vis_packed, mesh.faces, face_id, bary)
+    extra = None if e_ind is None else interpolate_vertex(e_ind, mesh.faces, face_id, bary)
     out = shade(m["albedo"], m["rough"], m["metal"], n, v, vis, light, lut, specular_occlusion=so,
-                layering=LAYERING)
+                layering=LAYERING, irr_extra=extra)
     out.update(m)
     return out
 
 
 @torch.no_grad()
-def init_albedo(mesh, vis_packed, light, cache, chunk=1 << 17, lo=0.02, hi=0.95):
+def init_albedo(mesh, vis_packed, light, cache, chunk=1 << 17, lo=0.02, hi=0.95, e_ind=None):
     """Per-vertex diffuse albedo estimate: Σ_w L_obs / Σ_w (E_vis/π), w = barycentric weight.
 
     Ignores specular (small for dielectrics); vertices without observations get the
@@ -108,6 +110,8 @@ def init_albedo(mesh, vis_packed, light, cache, chunk=1 << 17, lo=0.02, hi=0.95)
         n = shading_normal(mesh, fid, bary)
         vis = interpolate_visibility(vis_packed, mesh.faces, fid, bary)
         E = ((vis * (n @ light.dirs.T).clamp_min(0)) @ light.bins) / math.pi    # [N, 3]
+        if e_ind is not None:
+            E = E + interpolate_vertex(e_ind, mesh.faces, fid, bary) / math.pi
         L = cache["rgb"][s:s + chunk].float()
         tri = mesh.faces[fid].long()
         for k in range(3):
@@ -127,7 +131,9 @@ def loss_space(x):
 
 # ----------------------------------------------------------------------------- eval
 @torch.no_grad()
-def render_view(mesh, mat, vis_packed, light, lut, cam, chunk=1 << 16, so=True, albedo_scale=None):
+def render_view(mesh, mat, vis_packed, light, lut, cam, chunk=1 << 16, so=True, albedo_scale=None, indirect=None):
+    """indirect: relight.indirect.IndirectLight (Phase 4) or None (direct light only)."""
+    e_ind = None if indirect is None else indirect.irradiance(mat, light, albedo_scale)
     g = rasterize(mesh, cam)
     m = g["mask"]
     fid, bary = g["face_id"][m], g["bary"][m]
@@ -138,7 +144,7 @@ def render_view(mesh, mat, vis_packed, light, lut, cam, chunk=1 << 16, so=True, 
     outs = {k: [] for k in img}
     for s in range(0, fid.shape[0], chunk):
         o = shade_points(mesh, mat, vis_packed, light, lut, fid[s:s + chunk], bary[s:s + chunk], cpos, so,
-                         albedo_scale)
+                         albedo_scale, e_ind)
         for k in img:
             outs[k].append(o[k] if o[k].ndim == 2 else o[k][:, None])
     for k in img:
@@ -157,7 +163,8 @@ def aligned_albedo_psnr(pred_lin, gt_lin, mask):
 
 
 @torch.no_grad()
-def evaluate(mesh, mat, vis_packed, lights, train_light, lut, ds, stride, img_dir: Path | None, n_vis=4, so=True):
+def evaluate(mesh, mat, vis_packed, lights, train_light, lut, ds, stride, img_dir: Path | None, n_vis=4, so=True,
+             indirect=None):
     rows = {k: [] for k in ("nvs_psnr_mask", "nvs_psnr_full", "albedo_psnr_aligned", "albedo_psnr_raw",
                             "rough_mse", *[f"relight_{e}_psnr_mask" for e in RELIGHT_ENVMAPS],
                             *[f"relight_{e}_psnr_full" for e in RELIGHT_ENVMAPS],
@@ -169,7 +176,7 @@ def evaluate(mesh, mat, vis_packed, lights, train_light, lut, ds, stride, img_di
         tv = ds.test_view(i)
         gm = torch.from_numpy(tv.mask).cuda()
         mask = gm > 0.5
-        out = render_view(mesh, mat, vis_packed, train_light, lut, tv.camera, so=so)
+        out = render_view(mesh, mat, vis_packed, train_light, lut, tv.camera, so=so, indirect=indirect)
         pred = tonemap(out["rgb"])
         gt = torch.from_numpy(tv.rgb).cuda()
         rows["nvs_psnr_mask"].append(psnr(pred, gt, mask))
@@ -183,7 +190,7 @@ def evaluate(mesh, mat, vis_packed, lights, train_light, lut, ds, stride, img_di
         rows["rough_mse"].append(float(((out["rough"][..., 0] - gt_r)[mask & out["mask"]] ** 2).mean()))
         relit = {}
         for e in RELIGHT_ENVMAPS:
-            o = render_view(mesh, mat, vis_packed, lights[e], lut, tv.camera, so=so)
+            o = render_view(mesh, mat, vis_packed, lights[e], lut, tv.camera, so=so, indirect=indirect)
             rgb, alpha = ds.relight_view(i, e)
             g_rel, a_rel = torch.from_numpy(rgb).cuda(), torch.from_numpy(alpha).cuda()
             p_rel = tonemap(o["rgb"])
@@ -191,7 +198,7 @@ def evaluate(mesh, mat, vis_packed, lights, train_light, lut, ds, stride, img_di
             rows[f"relight_{e}_psnr_full"].append(psnr(p_rel * o["mask"][..., None], g_rel * a_rel[..., None]))
             relit[e] = (p_rel * o["mask"][..., None], g_rel * a_rel[..., None])
             o2 = render_view(mesh, mat, vis_packed, lights[e], lut, tv.camera, so=so,
-                             albedo_scale=torch.tensor(sc, device="cuda"))
+                             albedo_scale=torch.tensor(sc, device="cuda"), indirect=indirect)
             rows[f"relight_{e}_psnr_mask_aligned"].append(psnr(tonemap(o2["rgb"]), g_rel, a_rel > 0.5))
         if img_dir is not None and i in vis_idx:
             gray = lambda x: x.expand(*x.shape[:2], 3)
@@ -235,6 +242,10 @@ def main():
     p.add_argument("--vis-tmin", type=float, default=10.0,
                    help="shadow rays start this many median edge lengths away (skips local mesh noise)")
     p.add_argument("--no-so", action="store_true", help="ablation: no specular occlusion")
+    p.add_argument("--indirect", action="store_true",
+                   help="Phase 4: one-bounce indirect diffuse light from the mesh itself (relight/indirect.py)")
+    p.add_argument("--indirect-grad", action="store_true",
+                   help="let the indirect term's gradient reach the albedo at the hit points (default: detached)")
     p.add_argument("--no-layering", action="store_true",
                    help="no diffuse attenuation by the specular layer (runs before 2026-11-15 Phase 5)")
     p.add_argument("--alpha-thr", type=float, default=0.99)
@@ -264,6 +275,15 @@ def main():
         h = median_edge_length(mesh)
         vis_packed = cached_vertex_visibility(mesh, dirs, model / f"visibility_K{a.dirs}_t{a.vis_tmin:g}.pt",
                                               eps=0.5 * h, tmin=a.vis_tmin * h)
+    indirect = None
+    if a.indirect:
+        from relight.indirect import IndirectLight
+        from relight.visibility import median_edge_length
+        h = median_edge_length(mesh)
+        ti = time.perf_counter()
+        indirect = IndirectLight.cached(mesh, vis_packed, dirs, model / f"indirect_K{a.dirs}_t{a.vis_tmin:g}.pt",
+                                        eps=0.5 * h, tmin=a.vis_tmin * h)
+        print(f"[indirect] transport {indirect.stats()} ({time.perf_counter() - ti:.1f}s)", flush=True)
     from relight.visibility import unpack_bits
     above = (mesh.vertex_normals @ dirs.T) > 0
     occl = 1 - unpack_bits(vis_packed).float().sum() / above.float().sum()
@@ -287,6 +307,10 @@ def main():
 
     if a.albedo_init == "data":
         alb0, seen = init_albedo(mesh, vis_packed, light, cache)
+        if indirect is not None:                     # one fixed-point step: re-estimate with the bounce light
+            with torch.no_grad():
+                e0 = indirect.M @ (alb0 / math.pi * indirect.direct_irradiance(light))
+            alb0, seen = init_albedo(mesh, vis_packed, light, cache, e_ind=e0)
         print(f"[init] data-driven albedo for {100 * seen:.1f}% of vertices, mean {alb0.mean(0).tolist()}")
     else:
         alb0 = float(a.albedo_init)
@@ -315,7 +339,8 @@ def main():
         cpos = cache["centers"][cache["cam"][idx].long()]
         if a.learn_light:
             light.refresh()
-        o = shade_points(mesh, mat, vis_packed, light, lut, fid, bary, cpos, so=not a.no_so)
+        e_ind = None if indirect is None else indirect.irradiance(mat, light, detach_material=not a.indirect_grad)
+        o = shade_points(mesh, mat, vis_packed, light, lut, fid, bary, cpos, so=not a.no_so, e_ind=e_ind)
         l_img = (loss_space(o["rgb"]) - loss_space(cache["rgb"][idx].float())).abs().mean()
         l_smooth = mat.edge_smoothness(edges, (a.smooth_albedo, a.smooth_rough))
         loss = l_img + l_smooth
@@ -350,8 +375,9 @@ def main():
         if not a.eval_only:
             torch.save({"log_env": light.log_env.detach().cpu()}, out_dir / "light.pt")
     te = time.perf_counter()
-    metrics = evaluate(mesh, mat, vis_packed, lights, light, lut, ds, a.eval_stride, out_dir / "images",
-                       so=not a.no_so)
+    with torch.no_grad():
+        metrics = evaluate(mesh, mat, vis_packed, lights, light, lut, ds, a.eval_stride, out_dir / "images",
+                           so=not a.no_so, indirect=indirect)
     metrics.update(light_metrics)
     metrics.update(seconds_total=time.perf_counter() - t0, seconds_eval=time.perf_counter() - te,
                    args=vars(a), occluded_share=float(occl), train_log=log)

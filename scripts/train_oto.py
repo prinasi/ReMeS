@@ -87,12 +87,20 @@ def stage_b(a, soup, views, light, lut, light_opt, log, t0, mapper=None):
     cm = ConnectedMesh(Vw[used], remap[faces], Aw[used], lr_pos=a.lr_pos_b, lr_color=a.lr_color, lr_spec=a.lr_spec)
     print(f"[stage B] {a.remesh}: {soup.verts.shape[0] * 3:,} soup corners -> {cm.faces.shape[0]:,} faces on "
           f"{cm.verts.shape[0]:,} vertices ({time.perf_counter() - t0:.0f}s)", flush=True)
+    if a.large_steps > 0:
+        cm.enable_large_steps(a.large_steps, a.lr_pos_ls)
+        print(f"[stage B] large-steps vertex optimisation, lambda {a.large_steps:g}, lr {a.lr_pos_ls:g}", flush=True)
+    lr_pos_b = a.lr_pos_ls if a.large_steps > 0 else a.lr_pos_b
+    physical_b = soup.is_albedo and mapper is not None and light is not None
+    cm.is_albedo = physical_b
+    if a.grad_diag:
+        grad_diagnostic(a, cm, views, light, lut, mapper if physical_b else None, a.grad_diag + "_start.pt")
     for it in range(1, a.stage_b_iters + 1):
         if a.remesh_every > 0 and it > 1 and (it - 1) % a.remesh_every == 0 and it <= a.stage_b_iters - a.remesh_every:
             info = cm.remesh(a.remesh_scale)
             print(f"[B {it - 1:5d}] remesh: target edge {info['target_len']:.4f}, V/F {info['before']} -> "
                   f"{info['after']}", flush=True)
-        cm.set_lr("verts", a.lr_pos_b * 0.1 ** (it / a.stage_b_iters))
+        cm.set_lr("verts", lr_pos_b * 0.1 ** (it / a.stage_b_iters))
         vi = random.randrange(len(views))
         cam, m, gt, mvp = views[vi]
         if light is not None:
@@ -122,6 +130,8 @@ def stage_b(a, soup, views, light, lut, light_opt, log, t0, mapper=None):
             log.append({"stage": "B", "iter": it, "faces": int(cm.faces.shape[0]), "L1": l_img.item(), "psnr": psnr})
             print(f"[B {it:5d}] faces {cm.faces.shape[0]:,}  L1 {l_img.item():.4f}  PSNR {psnr:.2f}  "
                   f"({time.perf_counter() - t0:.0f}s)", flush=True)
+    if a.grad_diag:
+        grad_diagnostic(a, cm, views, light, lut, mapper if physical_b else None, a.grad_diag + "_end.pt")
     cm.max_cov.zero_()
     with torch.no_grad():
         for cam, m, gt, mvp in views:
@@ -182,6 +192,70 @@ def carve_views(views):
     return out
 
 
+class _DetachedReceiver:
+    """Shadow mapper proxy whose receiver positions carry no gradient (diagnostic)."""
+    def __init__(self, mapper):
+        self.m = mapper
+
+    def visibility(self, maps, X):
+        return self.m.visibility(maps, X.detach())
+
+
+def grad_diagnostic(a, cm, views, light, lut, mapper, path):
+    """Per-loss-term gradients on the vertex positions, summed over all training views. The image term is
+    split by path: shadow occluders (shadow maps), shadow receivers (lookup position), shading normals,
+    and the rest (rasterisation / antialias / view direction). Saved to `path` for offline analysis."""
+    from relight.oto import render_triangles
+    V = cm.verts
+    terms = ("img", "img_occ_detached", "img_shadow_detached", "img_shadow_nrm_detached", "mask", "dn", "lap",
+             "nc", "albedo")
+    acc = {t: torch.zeros_like(V) for t in terms}
+    if light is not None:
+        light.refresh()
+    physical = mapper is not None and light is not None and cm_is_albedo(cm)
+    idx = prob = None
+    if physical:
+        idx, prob = sample_directions(light.bins, light.dirs, a.shadow_dirs)
+    for cam, m, gt, mvp in views:
+        A = cm.attributes()
+        fn = cm.face_normals()
+        variants = {}
+        if physical:
+            maps = mapper.render(V, cm.faces, light.dirs[idx])
+            maps_d = mapper.render(V.detach(), cm.faces, light.dirs[idx])
+            sh = lambda mp, mpr: {"mapper": mpr, "maps": mp, "idx": idx, "prob": prob}
+            variants = {"img": (sh(maps, mapper), fn), "img_occ_detached": (sh(maps_d, mapper), fn),
+                        "img_shadow_detached": (sh(maps_d, _DetachedReceiver(mapper)), fn),
+                        "img_shadow_nrm_detached": (sh(maps_d, _DetachedReceiver(mapper)), fn.detach())}
+        else:
+            variants = {"img": (None, fn), "img_shadow_nrm_detached": (None, fn.detach())}
+        o = None
+        for name, (shadow, fnv) in variants.items():
+            o = render_triangles(V, cm.faces, A, fnv, cam, light, lut, mvp, shadow)
+            l_img = (gamma(o["rgb"]) - gt).abs().mean()
+            g = torch.autograd.grad(l_img, V, retain_graph=True, allow_unused=True)[0]
+            if g is not None:
+                acc[name] += g
+        o = render_triangles(V, cm.faces, A, fn, cam, light, lut, mvp,
+                             {"mapper": mapper, "maps": mapper.render(V, cm.faces, light.dirs[idx]), "idx": idx,
+                              "prob": prob} if physical else None)
+        regs = {"mask": a.lambda_mask * (o["alpha"] - m).abs().mean(), "dn": a.lambda_dn * cm_dn(o),
+                "lap": a.lambda_lap * cm.laplacian_loss(), "nc": a.lambda_nc * cm.normal_consistency_loss()}
+        if physical and a.lambda_albedo > 0:
+            regs["albedo"] = a.lambda_albedo * albedo_smoothness(o, gt)
+        for name, l in regs.items():
+            g = torch.autograd.grad(l, V, retain_graph=True, allow_unused=True)[0]
+            if g is not None:
+                acc[name] += g
+    torch.save({"verts": V.detach().cpu(), "faces": cm.faces.cpu(), "physical": physical,
+                "grads": {k: v.cpu() for k, v in acc.items()}}, path)
+    print(f"[grad-diag] -> {path}", flush=True)
+
+
+def cm_is_albedo(cm):
+    return getattr(cm, "is_albedo", True)
+
+
 def cm_dn(o):
     return OpaqueSoup.depth_normal_loss(o)
 
@@ -207,6 +281,12 @@ def main():
                    help="texture-weighted planarity prior (screen-space 2nd differences of inverse depth); 0 = off")
     p.add_argument("--flat-sigma", type=float, default=0.02, help="image-gradient scale of the texture weight")
     p.add_argument("--flat-from", type=int, default=0)
+    p.add_argument("--large-steps", type=float, default=0.0,
+                   help="Stage B: lambda of the smoothness-preconditioned vertex update (Nicolet et al. 2021; "
+                        "relight/largesteps.py); 0 = per-coordinate Adam")
+    p.add_argument("--lr-pos-ls", type=float, default=1e-3, help="Stage B vertex lr with --large-steps")
+    p.add_argument("--grad-diag", default="", help="Stage B: save per-loss-term vertex gradients (all views) to "
+                                                   "<prefix>_start.pt / _end.pt")
     p.add_argument("--lr-pos", type=float, default=2e-4)
     p.add_argument("--lr-pos-final", type=float, default=2e-5)
     p.add_argument("--lr-color", type=float, default=1e-2)

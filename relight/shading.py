@@ -218,16 +218,19 @@ def prefilter_pyramid(env: torch.Tensor, levels, chunk: int = 2048) -> list[torc
 
 # ----------------------------------------------------------------------- shading
 def shade(albedo, rough, metal, n, v, vis, light: EnvLight, lut: torch.Tensor,
-          specular_occlusion: bool = True, layering: bool = True) -> dict:
+          specular_occlusion: bool = True, layering: bool = True, irr_extra: torch.Tensor | None = None) -> dict:
     """Outgoing linear radiance for N points.
 
     albedo [N,3], rough [N], metal [N], n (unit shading normal) [N,3],
     v (unit direction to the camera) [N,3], vis [N,K] in [0,1].
     layering: attenuate diffuse by the specular layer's directional albedo (F0·A + B),
     as Blender's Principled BSDF (v2) does for energy conservation (Phase 5 parity).
+    irr_extra [N,3]: additional diffuse irradiance (Phase 4 one-bounce indirect, relight/indirect.py).
     """
     cos = (n @ light.dirs.T).clamp_min(0)                               # [N, K]
     irradiance = (vis * cos) @ light.bins                               # [N, 3]
+    if irr_extra is not None:
+        irradiance = irradiance + irr_extra
     diffuse = (1 - metal)[:, None] * albedo / math.pi * irradiance
 
     nv = (n * v).sum(-1).clamp(1e-4, 1)
