@@ -732,3 +732,8 @@ training views (nvdiffrast antialiased coverage, L2) with a Laplacian on the dis
 | v6 | 34.37 / 0.975 / 0.049 | 33.91 / 0.969 / 0.063 | 29.44 / 0.949 / 0.071 | 0.0105 |
 | **v8 (silhouette-refined)** | **35.94 / 0.979 / 0.045** | **34.47 / 0.972 / 0.059** | **29.98 / 0.952 / 0.068** | **0.0104** |
 | v8, 2× iterations / lr | 35.97 / 0.979 / 0.045 | 34.43 / 0.972 / 0.059 | 29.95 / 0.952 / 0.068 | 0.0104 |
+
+Blender (Cycles, masked, aligned albedo; 4-scene means) for the refined v8 assets vs the previous best learned-
+light v6 run: Cycles GI vs GT 27.07 / 27.11 (v6: 26.85 / 26.76), Cycles direct vs GT 26.09 / 25.81 (25.91 / 25.48),
+ReMeS vs GT 27.26 / 27.07 (26.92 / 26.60); parity (Cycles direct vs ReMeS) 31.95 / 33.41 (v6: 32.45 / 33.78) — the
+per-face texture tiles and learned normals cost ≈ 0.4 dB of parity, still > 31.9 dB.
