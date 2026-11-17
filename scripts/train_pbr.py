@@ -242,8 +242,9 @@ def main():
     p.add_argument("--vis-tmin", type=float, default=10.0,
                    help="shadow rays start this many median edge lengths away (skips local mesh noise)")
     p.add_argument("--no-so", action="store_true", help="ablation: no specular occlusion")
-    p.add_argument("--indirect", action="store_true",
-                   help="Phase 4: one-bounce indirect diffuse light from the mesh itself (relight/indirect.py)")
+    p.add_argument("--indirect", action=argparse.BooleanOptionalAction, default=True,
+                   help="Phase 4: one-bounce indirect diffuse light from the mesh itself (relight/indirect.py); "
+                        "--no-indirect = direct light only")
     p.add_argument("--indirect-grad", action="store_true",
                    help="let the indirect term's gradient reach the albedo at the hit points (default: detached)")
     p.add_argument("--no-layering", action="store_true",

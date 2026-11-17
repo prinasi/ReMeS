@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # OTO-style geometry (Stage A soup + Stage B connected mesh) on Synthetic4Relight scenes, then the
-# downstream pipeline: Phase 2 (oracle light) and Phase 5 (Blender) on the new relight_mesh.pt.
+# downstream pipeline: Phase 2 (oracle light, with Phase 4 one-bounce indirect light) and Phase 5 (Blender)
+# on the new relight_mesh.pt; LEARN_LIGHT=1 adds Phase 3 (learned light) + Blender.
 #   bash scripts/oto_real.sh <gpu> <tag> <scene> [<scene> ...]
 # Extra train_oto.py arguments via OTO_ARGS; "@SCENE@" is replaced by the scene name, e.g.
 #   OTO_ARGS="--init mesh:output/synthetic4relight/@SCENE@" bash scripts/oto_real.sh 0 v6 jugs
@@ -17,5 +18,9 @@ for scene in "$@"; do
     run "$ROOT/scripts/diagnose_geometry.py" -m "$M" --scene "$scene"
     run "$ROOT/scripts/train_pbr.py" -m "$M" --scene "$scene" --out pbr_oracle
     run "$ROOT/scripts/eval_blender.py" -m "$M" --scene "$scene" --run pbr_oracle
+    if [ -n "${LEARN_LIGHT:-}" ]; then                      # Phase 3: learned training light
+        run "$ROOT/scripts/train_pbr.py" -m "$M" --scene "$scene" --learn-light --out pbr_learned
+        run "$ROOT/scripts/eval_blender.py" -m "$M" --scene "$scene" --run pbr_learned
+    fi
     echo "=== [$scene] done"
 done

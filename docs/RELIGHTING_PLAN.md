@@ -629,3 +629,19 @@ Four scenes, v6 geometry, oracle light (means):
 
 Largest gains on hotdog / air_baloons (raw albedo ≈ +1 dB). The ReMeS renderer is now within 0.1–0.25 dB of
 Cycles with full GI. Recommended: `--indirect` for all material fits.
+
+`--indirect` is now the `train_pbr.py` default (`--no-indirect` for direct only); `oto_real.sh` runs it, and
+`LEARN_LIGHT=1` adds Phase 3 + Blender. Phase 3 (learned light) on v6 geometry, four-scene means
+(raw albedo / relighting are scale-ambiguous with a learned light; aligned columns and Blender use the
+albedo alignment):
+
+| | Albedo aligned / raw | Rough MSE | Relight env6 / env12 (aligned) | ReMeS vs GT env6 / env12 | Cycles GI vs GT env6 / env12 | Light PSNR |
+|---|---|---|---|---|---|---|
+| oracle light, direct | 24.44 / 22.85 | 0.0609 | 26.74 / 26.44 | 26.37 / 26.26 | 26.98 / 27.19 | — |
+| oracle light, + indirect | **24.80 / 23.65** | **0.0582** | **27.56 / 27.52** | **27.20 / 27.32** | **27.29 / 27.57** | — |
+| learned light, direct | 22.93 / 17.46 | 0.0649 | 25.94 / 25.39 | 25.79 / 25.29 | 26.03 / 25.89 | 13.94 |
+| learned light, + indirect | **23.32 / 18.02** | **0.0640** | **26.76 / 26.54** | **26.53 / 26.36** | **26.47 / 26.46** | 13.90 |
+
+The bounce term gains about as much with a learned light (+0.8 / +1.15 dB aligned relighting, +0.4 / +0.6 dB
+Cycles) as with the oracle; the learned envmap itself stays at ≈ 13.9 dB (aligned) — the remaining gap to the
+oracle (≈ 0.8–1.1 dB in Cycles) is light estimation.
