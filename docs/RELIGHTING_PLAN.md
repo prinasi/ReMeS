@@ -773,3 +773,18 @@ appearance resolution decoupled from the mesh. Geometry vs GT, then an oracle-li
   iterations are more than needed.
 * Remaining geometry errors are observability (textureless slab height) and silhouettes, not appearance
   compensation.
+
+### v9: physical shading from 1000 + Stage-B face textures 8, then silhouette refinement (four scenes)
+
+`OTO_ARGS="--init mesh:output/synthetic4relight/@SCENE@ --pbr-from 1000 --face-tex-b 8" LEARN_LIGHT=1
+scripts/oto_real.sh` (these two are now the `train_oto.py` defaults). Learned light, best Phase 3 setting:
+
+| | NVS PSNR / SSIM / LPIPS | Relight PSNR / SSIM / LPIPS | Albedo PSNR / SSIM / LPIPS | Rough MSE |
+|---|---|---|---|---|
+| R3DG | 36.80 / 0.982 / 0.028 | 31.00 / 0.964 / 0.050 | 28.31 / 0.951 / 0.058 | 0.0130 |
+| v8 | 35.94 / 0.979 / 0.045 | 34.47 / 0.972 / 0.059 | 29.98 / 0.952 / 0.068 | 0.0104 |
+| **v9** | **36.12 / 0.980 / 0.044** | **34.61 / 0.973 / 0.057** | **30.04 / 0.953 / 0.068** | 0.0106 |
+
+Blender (masked): learned light Cycles GI vs GT 27.06 / 27.18 (v8 27.07 / 27.11), parity 32.44 / 34.43 (v8 31.95 /
+33.41); oracle light Cycles GI vs GT 27.83 / 28.29 (v6 oracle + indirect: 27.29 / 27.57). The Stage-B textures'
+silhouette benefit largely overlaps with the silhouette refinement (+0.2 dB NVS on top of it, vs ≈ +1 dB without).

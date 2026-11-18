@@ -331,7 +331,7 @@ def main():
     p.add_argument("--indirect-every", type=int, default=500, help="rebuild the transport every N Stage-B its")
     p.add_argument("--indirect-dirs", type=int, default=256, help="gathering directions of the transport")
     p.add_argument("--vis-tmin-b", type=float, default=10.0, help="visibility ray start offset (x median edge)")
-    p.add_argument("--face-tex-b", type=int, default=0,
+    p.add_argument("--face-tex-b", type=int, default=8,
                    help="Stage B: per-face RxR log-albedo residual textures (appearance capacity decoupled from "
                         "the mesh); 0 = per-vertex only")
     p.add_argument("--face-tex-from", type=int, default=1, help="Stage B iteration where the textures start learning")
@@ -359,7 +359,7 @@ def main():
     p.add_argument("--mv-patch", type=int, default=7)
     p.add_argument("--mv-neighbours", type=int, default=4)
     p.add_argument("--mv-tex-thr", type=float, default=0.01, help="min reference patch std (gamma units)")
-    p.add_argument("--pbr-from", type=int, default=4000,
+    p.add_argument("--pbr-from", type=int, default=1000,
                    help="switch diffuse from free radiance to albedo x shadowed irradiance at this iteration (-1 = never)")
     p.add_argument("--shadow-dirs", type=int, default=32,
                    help="light bins (Fibonacci) for diffuse irradiance; all are shadow-mapped every iteration")
