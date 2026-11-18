@@ -737,3 +737,39 @@ Blender (Cycles, masked, aligned albedo; 4-scene means) for the refined v8 asset
 light v6 run: Cycles GI vs GT 27.07 / 27.11 (v6: 26.85 / 26.76), Cycles direct vs GT 26.09 / 25.81 (25.91 / 25.48),
 ReMeS vs GT 27.26 / 27.07 (26.92 / 26.60); parity (Cycles direct vs ReMeS) 31.95 / 33.41 (v6: 32.45 / 33.78) — the
 per-face texture tiles and learned normals cost ≈ 0.4 dB of parity, still > 31.9 dB.
+
+### Geometry / appearance balance sweep (SynthGeo, T²-Splat init; `scripts/geo_capacity_sweep.sh`)
+
+Question: does limited appearance capacity (per-vertex / per-corner colours) or the free-radiance phase of the
+soup stage (radiance until `--pbr-from 4000`) make geometry compensate for appearance? New Stage-B option:
+per-face R×R log-albedo residual textures (`--face-tex-b R`, `--face-tex-from`, `--lambda-face-tex`), i.e.
+appearance resolution decoupled from the mesh. Geometry vs GT, then an oracle-light material fit (`pbr_cap`):
+
+| Scene | Variant | Acc | Normal | Slab | Obj depth | NVS full | Albedo | Relight 6 / 12 full |
+|---|---|---|---|---|---|---|---|---|
+| textured | base (pbr-from 4000) | 0.027 | 1.8° | −0.045 | 0.031 | 36.69 | 31.56 | 37.94 / 36.55 |
+| textured | physical from it 1 | 0.061 | 2.1° | −0.040 | 0.036 | 37.06 | 32.18 | 38.39 / 36.89 |
+| textured | physical from it 1000 | 0.021 | 1.8° | −0.042 | 0.035 | 36.85 | 31.76 | 38.09 / 36.66 |
+| textured | Stage B face tex 4 | 0.026 | 1.7° | −0.044 | 0.028 | 37.49 | 31.68 | 38.61 / 37.00 |
+| textured | Stage B face tex 8 | 0.028 | 1.8° | −0.045 | 0.032 | 37.68 | 31.74 | 38.76 / 37.12 |
+| textured | face tex 8 from it 2500 | 0.027 | 1.8° | −0.045 | 0.030 | 37.08 | 31.62 | 38.17 / 36.81 |
+| glossy | base | 0.075 | 2.3° | −0.047 | 0.128 | 36.47 | 30.66 | 36.41 / 36.22 |
+| glossy | physical from it 1 | 0.089 | 2.4° | −0.046 | 0.131 | 36.53 | 30.74 | 36.44 / 36.26 |
+| glossy | physical from it 1000 | 0.073 | 2.2° | −0.047 | 0.132 | 36.78 | 30.76 | 36.64 / 36.35 |
+| glossy | Stage B face tex 4 | 0.074 | 2.3° | −0.046 | 0.125 | 36.92 | 30.65 | 36.74 / 36.44 |
+| glossy | Stage B face tex 8 | 0.075 | 2.3° | −0.047 | 0.126 | 37.02 | 30.67 | 36.80 / 36.49 |
+| glossy | face tex 8 from it 2500 | 0.075 | 2.3° | −0.047 | 0.127 | 36.81 | 30.67 | 36.70 / 36.39 |
+
+* Interior geometry does not depend on appearance capacity: with per-face textures in Stage B, accuracy,
+  normals, slab and object depth stay within noise. Per-vertex appearance is not starving the geometry.
+* The downstream gain of Stage-B textures (+0.6–1.0 dB NVS, +0.4–0.8 dB relighting) is at the silhouettes: on
+  textured, the coverage share of the NVS error drops from 56 % to 46 % (`nvs_error_attribution.py`), the
+  interior error is unchanged — with per-vertex colours, boundary vertices are pulled to fit colour; textures
+  relieve them (mild compensation at boundaries only). The coarse-to-fine schedule (textures from 2500) is
+  worse than textures from the start.
+* Free-radiance phase: removing it (physical from it 1) hurts object accuracy (0.027 → 0.061, 0.075 → 0.089)
+  though textured relighting improves (contact region +0.6 dB); shortening it to 1000 is neutral to slightly
+  positive everywhere. The radiance phase helps bootstrap geometry before the light is estimated, but 4000
+  iterations are more than needed.
+* Remaining geometry errors are observability (textureless slab height) and silhouettes, not appearance
+  compensation.

@@ -93,6 +93,10 @@ def stage_b(a, soup, views, light, lut, light_opt, log, t0, mapper=None):
     lr_pos_b = a.lr_pos_ls if a.large_steps > 0 else a.lr_pos_b
     physical_b = soup.is_albedo and mapper is not None and light is not None
     cm.is_albedo = physical_b
+    if a.face_tex_b > 0:
+        cm.enable_face_tex(a.face_tex_b, a.lr_face_tex)
+        print(f"[stage B] per-face {a.face_tex_b}x{a.face_tex_b} log-albedo textures from iteration {a.face_tex_from}",
+              flush=True)
     if a.grad_diag:
         grad_diagnostic(a, cm, views, light, lut, mapper if physical_b else None, a.grad_diag + "_start.pt")
     ind = None
@@ -120,6 +124,8 @@ def stage_b(a, soup, views, light, lut, light_opt, log, t0, mapper=None):
             + a.lambda_lap * cm.laplacian_loss() + a.lambda_nc * cm.normal_consistency_loss()
         if a.lambda_flat > 0:
             loss = loss + a.lambda_flat * flatness_loss(o, cam, texture_weight(gt, a.flat_sigma))
+        if cm.face_tex is not None:
+            loss = loss + a.lambda_face_tex * (cm.face_tex ** 2).mean()
         l_mv, _ = mv_term(a, o, views, vi, cm.verts, cm.faces, 1 << 30)       # always on in Stage B
         loss = loss + a.lambda_mv * l_mv + a.lambda_mvs * mvs_term(a, o, views, vi)
         if shadow is not None and a.lambda_albedo > 0:
@@ -128,6 +134,10 @@ def stage_b(a, soup, views, light, lut, light_opt, log, t0, mapper=None):
             loss = loss + a.env_tv * light.tv()
         loss.backward()
         cm.step()
+        if cm.face_tex is not None:
+            if it >= a.face_tex_from:
+                cm.tex_opt.step()
+            cm.tex_opt.zero_grad(set_to_none=True)
         if light_opt is not None and light.log_env.requires_grad:
             light_opt.step()
             light_opt.zero_grad(set_to_none=True)
@@ -321,6 +331,12 @@ def main():
     p.add_argument("--indirect-every", type=int, default=500, help="rebuild the transport every N Stage-B its")
     p.add_argument("--indirect-dirs", type=int, default=256, help="gathering directions of the transport")
     p.add_argument("--vis-tmin-b", type=float, default=10.0, help="visibility ray start offset (x median edge)")
+    p.add_argument("--face-tex-b", type=int, default=0,
+                   help="Stage B: per-face RxR log-albedo residual textures (appearance capacity decoupled from "
+                        "the mesh); 0 = per-vertex only")
+    p.add_argument("--face-tex-from", type=int, default=1, help="Stage B iteration where the textures start learning")
+    p.add_argument("--lr-face-tex", type=float, default=1e-2)
+    p.add_argument("--lambda-face-tex", type=float, default=1e-3, help="L2 on the log-albedo residual")
     p.add_argument("--grad-diag", default="", help="Stage B: save per-loss-term vertex gradients (all views) to "
                                                    "<prefix>_start.pt / _end.pt")
     p.add_argument("--lr-pos", type=float, default=2e-4)

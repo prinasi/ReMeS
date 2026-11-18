@@ -210,7 +210,22 @@ class OpaqueSoup:
 
 
 # ---------------------------------------------------------------------- shared renderer
-def _shade_layer(rast, V, faces, attrs, face_normals, o, light, lut, shadow):
+def sample_face_tex(tex: torch.Tensor, face_id: torch.Tensor, uv: torch.Tensor) -> torch.Tensor:
+    """Bilinear sample of per-face R x R tiles [F, R, R, C] at nvdiffrast barycentrics uv [N, 2] -> [N, C]."""
+    R = tex.shape[1]
+    t = tex[face_id]
+    if R == 1:
+        return t[:, 0, 0]
+    x, y = uv[:, 0] * (R - 1), uv[:, 1] * (R - 1)
+    x0 = x.detach().floor().clamp(0, R - 2).long()
+    y0 = y.detach().floor().clamp(0, R - 2).long()
+    fx, fy = (x - x0)[:, None], (y - y0)[:, None]
+    ar = torch.arange(len(face_id), device=face_id.device)
+    return (1 - fy) * ((1 - fx) * t[ar, y0, x0] + fx * t[ar, y0, x0 + 1]) \
+        + fy * ((1 - fx) * t[ar, y0 + 1, x0] + fx * t[ar, y0 + 1, x0 + 1])
+
+
+def _shade_layer(rast, V, faces, attrs, face_normals, o, light, lut, shadow, face_tex=None):
     """Shade one rasterised layer. Returns (rgb [H,W,3] masked, mask, n, pos, tri, interp)."""
     tri = rast[0, ..., 3].long() - 1
     mask = tri >= 0
@@ -222,6 +237,9 @@ def _shade_layer(rast, V, faces, attrs, face_normals, o, light, lut, shadow):
     d = F.normalize(pos - o, dim=-1)
     n = torch.where(((n * d).sum(-1, keepdim=True) > 0), -n, n)                      # face the camera
     rgb = interp[..., 0:3]
+    if face_tex is not None and mask.any():                   # per-face log-albedo residual textures (Stage B)
+        r = sample_face_tex(face_tex, tri[mask], rast[0, ..., 0:2][mask])
+        rgb = rgb.index_put(mask.nonzero(as_tuple=True), (rgb[mask] * torch.exp(r)).clamp(max=DIFFUSE_MAX))
     if light is not None and mask.any():
         dm, nm = d[mask], n[mask]
         refl = F.normalize(dm - 2 * (dm * nm).sum(-1, keepdim=True) * nm, dim=-1)
@@ -268,7 +286,7 @@ def edge_alpha(clip: torch.Tensor, faces: torch.Tensor, tri: torch.Tensor, mask:
 
 def render_triangles(V: torch.Tensor, faces: torch.Tensor, attrs: torch.Tensor, face_normals: torch.Tensor, cam, light,
                      lut, mvp: torch.Tensor | None = None, shadow: dict | None = None,
-                     soft_edge_tau: float = 0.0) -> dict:
+                     soft_edge_tau: float = 0.0, face_tex: torch.Tensor | None = None) -> dict:
     """Opaque z-buffer render of triangles with per-vertex attrs [N, 5] = (diffuse, F0, roughness).
 
     shadow=None: the diffuse attribute is outgoing radiance (free appearance).
@@ -293,7 +311,8 @@ def render_triangles(V: torch.Tensor, faces: torch.Tensor, attrs: torch.Tensor, 
             rast2, _ = peeler.rasterize_next_layer()
     else:
         rast, _ = dr.rasterize(get_context(dev), clip, faces, resolution=res)
-    rgb, mask, n, pos, tri, interp = _shade_layer(rast, V, faces, attrs, face_normals, o, light, lut, shadow)
+    rgb, mask, n, pos, tri, interp = _shade_layer(rast, V, faces, attrs, face_normals, o, light, lut, shadow,
+                                                  face_tex)
     rgba = torch.cat([rgb, mask[..., None].float()], -1)
     aa = dr.antialias(rgba[None].contiguous(), rast, clip, faces)[0]
     out_rgb = aa[..., :3]
@@ -379,6 +398,12 @@ class ConnectedMesh:
         self._edges()
         self.max_cov = torch.zeros(self.faces.shape[0], device=V.device)
         self.large = None
+        self.face_tex = None
+
+    def enable_face_tex(self, res: int, lr: float):
+        """Per-face res x res log-albedo residual textures (appearance resolution independent of the mesh)."""
+        self.face_tex = torch.zeros(self.faces.shape[0], res, res, 3, device=self.verts.device, requires_grad=True)
+        self.tex_opt = torch.optim.Adam([self.face_tex], lr=lr)
 
     def enable_large_steps(self, lam: float, lr: float):
         """Optimise vertex positions with relight/largesteps.py (smoothness-preconditioned, uniform Adam)
@@ -416,7 +441,7 @@ class ConnectedMesh:
 
     def render(self, cam, light, lut, mvp=None, track_coverage=False, shadow=None, soft_edge_tau=0.0):
         out = render_triangles(self.verts, self.faces, self.attributes(), self.face_normals(), cam, light, lut, mvp,
-                               shadow, soft_edge_tau)
+                               shadow, soft_edge_tau, face_tex=self.face_tex)
         if track_coverage:
             with torch.no_grad():
                 m = out["mask"]
@@ -461,6 +486,8 @@ class ConnectedMesh:
         self.max_cov = torch.zeros(self.faces.shape[0], device=V.device)
         if self.large is not None:
             self.enable_large_steps(self.large.lam, self.large.lr)
+        if self.face_tex is not None:
+            self.enable_face_tex(self.face_tex.shape[1], self.tex_opt.param_groups[0]["lr"])
         return {"target_len": target, "before": before, "after": (Vn.shape[0], Fn.shape[0])}
 
     @torch.no_grad()
@@ -468,6 +495,8 @@ class ConnectedMesh:
         if remove.any():
             self.faces = self.faces[~remove].contiguous()
             self.max_cov = self.max_cov[~remove]
+            if self.face_tex is not None:
+                self.enable_face_tex(self.face_tex.shape[1], self.tex_opt.param_groups[0]["lr"])
             self._edges()
             if self.large is not None:
                 self.enable_large_steps(self.large.lam, self.large.lr)
