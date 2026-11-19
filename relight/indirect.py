@@ -36,35 +36,13 @@ class IndirectLight:
     @torch.no_grad()
     def build(cls, mesh: FrozenMesh, vis_packed: torch.Tensor, dirs: torch.Tensor, eps: float, tmin: float,
               chunk_vertices: int = 8192) -> "IndirectLight":
-        V, K = mesh.vertices.shape[0], dirs.shape[0]
-        tracer = MeshTracer(mesh.vertices, mesh.faces)
+        V = mesh.vertices.shape[0]
+        r = blocked_hits(mesh, vis_packed, dirs, eps, tmin, chunk_vertices)
         faces = mesh.faces.long()
-        fv = mesh.vertices[faces]
-        fn = torch.nn.functional.normalize(torch.cross(fv[:, 1] - fv[:, 0], fv[:, 2] - fv[:, 0], dim=-1), dim=-1)
-        d_omega = 4 * math.pi / K
-        rows, cols, vals = [], [], []
-        A = torch.empty(V, K, dtype=torch.float16, device=mesh.vertices.device)
-        for s in range(0, V, chunk_vertices):
-            x = mesh.vertices[s:s + chunk_vertices]
-            n = mesh.vertex_normals[s:s + chunk_vertices]
-            cos = n @ dirs.T                                                   # [B, K]
-            vis = unpack_bits(vis_packed[s:s + chunk_vertices])
-            A[s:s + chunk_vertices] = (vis.float() * cos.clamp_min(0)).half()
-            bi, ki = ((cos > 0) & ~vis).nonzero(as_tuple=True)
-            if bi.numel() == 0:
-                continue
-            d = dirs[ki]
-            o = x[bi] + eps * n[bi] + tmin * d
-            hit, _, fid, bary = tracer.closest_hit(o, d)
-            front = hit & ((fn[fid.clamp_min(0)] * d).sum(-1) < 0)               # light leaves the hit's front side
-            bi, ki, fid, bary = bi[front], ki[front], fid[front], bary[front]
-            w = cos[bi, ki] * d_omega
-            rows.append((bi + s).repeat_interleave(3))
-            cols.append(faces[fid].reshape(-1))
-            vals.append((w[:, None] * bary).reshape(-1))
-        idx = torch.stack([torch.cat(rows), torch.cat(cols)])
-        M = torch.sparse_coo_tensor(idx, torch.cat(vals), (V, V)).coalesce().to_sparse_csr()
-        return cls(M, A)
+        idx = torch.stack([r["v"].long().repeat_interleave(3), faces[r["face"].long()].reshape(-1)])
+        vals = (r["cosw"][:, None] * r["bary"].float()).reshape(-1)
+        M = torch.sparse_coo_tensor(idx, vals, (V, V)).coalesce().to_sparse_csr()
+        return cls(M, cls.build_direct(mesh, vis_packed, dirs))
 
     @staticmethod
     @torch.no_grad()
@@ -108,6 +86,41 @@ class IndirectLight:
     def stats(self) -> dict:
         return {"nnz": int(self.M.values().numel()),
                 "rows_with_indirect": int((self.M.crow_indices()[1:] > self.M.crow_indices()[:-1]).sum())}
+
+
+@torch.no_grad()
+def blocked_hits(mesh: FrozenMesh, vis_packed: torch.Tensor, dirs: torch.Tensor, eps: float, tmin: float,
+                 chunk_vertices: int = 8192) -> dict:
+    """Closest hits of every blocked visibility direction above each vertex's tangent plane.
+
+    Returns records (front-face hits only; back-face hits carry no light): vertex 'v' [R] int32, direction 'k' [R]
+    int32, hit 'face' [R] int32, 'bary' [R, 3] float32, 'cosw' [R] = max(n_v·w_k, 0)·4π/K."""
+    V, K = mesh.vertices.shape[0], dirs.shape[0]
+    tracer = MeshTracer(mesh.vertices, mesh.faces)
+    faces = mesh.faces.long()
+    fv = mesh.vertices[faces]
+    fn = torch.nn.functional.normalize(torch.cross(fv[:, 1] - fv[:, 0], fv[:, 2] - fv[:, 0], dim=-1), dim=-1)
+    d_omega = 4 * math.pi / K
+    out = {k: [] for k in ("v", "k", "face", "bary", "cosw")}
+    for s in range(0, V, chunk_vertices):
+        x = mesh.vertices[s:s + chunk_vertices]
+        n = mesh.vertex_normals[s:s + chunk_vertices]
+        cos = n @ dirs.T                                                   # [B, K]
+        vis = unpack_bits(vis_packed[s:s + chunk_vertices])
+        bi, ki = ((cos > 0) & ~vis).nonzero(as_tuple=True)
+        if bi.numel() == 0:
+            continue
+        d = dirs[ki]
+        o = x[bi] + eps * n[bi] + tmin * d
+        hit, _, fid, bary = tracer.closest_hit(o, d)
+        front = hit & ((fn[fid.clamp_min(0)] * d).sum(-1) < 0)               # light leaves the hit's front side
+        bi, ki, fid, bary = bi[front], ki[front], fid[front], bary[front]
+        out["v"].append((bi + s).int())
+        out["k"].append(ki.int())
+        out["face"].append(fid.int())
+        out["bary"].append(bary)
+        out["cosw"].append(cos[bi, ki] * d_omega)
+    return {k: torch.cat(v) for k, v in out.items()}
 
 
 def interpolate_vertex(values: torch.Tensor, faces: torch.Tensor, face_id: torch.Tensor,

@@ -35,7 +35,7 @@ from relight.mesh import load_relight_mesh  # noqa: E402
 from relight.shading import EnvLight, brdf_lut, fibonacci_sphere  # noqa: E402
 from relight.visibility import cached_vertex_visibility, median_edge_length  # noqa: E402
 from export_pbr import load_material  # noqa: E402
-from train_pbr import render_view  # noqa: E402
+from train_pbr import make_indirect, render_view  # noqa: E402
 
 
 def blender(glb, envmap, transforms, frames, out_dir, samples, direct, width):
@@ -67,7 +67,8 @@ def main():
     metrics_run = json.loads((run / "metrics.json").read_text())
     scale = [1.0, 1.0, 1.0] if a.no_align else metrics_run["albedo_scale_mean"]
 
-    mesh = load_relight_mesh(model)
+    cache_dir = run if (run / "relight_mesh.pt").is_file() else model      # Phase 6 runs carry a refined mesh
+    mesh = load_relight_mesh(cache_dir)
     mat = load_material(mesh, run)
     with torch.no_grad():
         v = mat.vertex_values()
@@ -86,15 +87,18 @@ def main():
 
     args = torch.load(run / "material.pt", map_location="cpu", weights_only=False)["args"]
     dirs = fibonacci_sphere(args["dirs"])
-    h = median_edge_length(mesh)
-    vis = cached_vertex_visibility(mesh, dirs, model / f"visibility_K{args['dirs']}_t{args['vis_tmin']:g}.pt",
+    h = median_edge_length(load_relight_mesh(model))             # ray offsets as in train_pbr.py (input mesh)
+    vis = cached_vertex_visibility(mesh, dirs, cache_dir / f"visibility_K{args['dirs']}_t{args['vis_tmin']:g}.pt",
                                    eps=0.5 * h, tmin=args["vis_tmin"] * h)
-    indirect = None
-    if args.get("indirect"):                                     # Phase 4 run: ReMeS-vs-GT includes the bounce light
-        from relight.indirect import IndirectLight
-        indirect = IndirectLight.cached(mesh, vis, dirs, model / f"indirect_K{args['dirs']}_t{args['vis_tmin']:g}.pt",
-                                        eps=0.5 * h, tmin=args["vis_tmin"] * h)
     lut = brdf_lut()
+    indirect = None
+    if args.get("indirect"):        # Phase 4 run: ReMeS-vs-GT includes the bounce light (+ interreflection if trained so)
+        indirect = make_indirect(mesh, vis, dirs, cache_dir, args["dirs"], args["vis_tmin"], lut,
+                                 args.get("interreflect", False), args.get("ir_bounces", 3), so=not args.get("no_so"),
+                                 h=h)
+        if hasattr(indirect, "bind"):
+            indirect.bind(mat)
+            indirect.aligned_scale = torch.tensor(scale, device="cuda")
     frames = list(range(0, ds.num_views("test"), a.frame_stride))
     cams = ds.cameras("test")
     transforms = ds.path / "transforms_test.json"

@@ -23,35 +23,18 @@ import sys
 import time
 from pathlib import Path
 
-import nvdiffrast.torch as dr
 import torch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from relight.data import Synthetic4Relight  # noqa: E402
-from relight.gbuffer import get_context, mvp_matrix  # noqa: E402
+from relight.gbuffer import mvp_matrix  # noqa: E402
+from relight.joint import coverage, laplacian  # noqa: E402
 from relight.mesh import FrozenMesh, load_relight_mesh, save_relight_mesh  # noqa: E402
 from relight.orient import vertex_normals  # noqa: E402
 
 SKIP_TOP_ROWS = 5
-
-
-def coverage(V, faces, mvp, res):
-    clip = (torch.cat([V, torch.ones_like(V[:, :1])], -1) @ mvp.T)[None].contiguous()
-    rast, _ = dr.rasterize(get_context(V.device), clip, faces, resolution=res)
-    a = (rast[..., 3:4] > 0).float()
-    return dr.antialias(a.contiguous(), rast, clip, faces)[0, ..., 0]
-
-
-def laplacian(n, edges):
-    a, b = edges[:, 0], edges[:, 1]
-    deg = torch.zeros(n, device=edges.device).index_add_(0, a, torch.ones_like(a, dtype=torch.float)) \
-        .index_add_(0, b, torch.ones_like(b, dtype=torch.float))
-    def apply(D):
-        nb = torch.zeros_like(D).index_add_(0, a, D[b]).index_add_(0, b, D[a])
-        return nb / deg.clamp_min(1)[:, None] - D
-    return apply
 
 
 @torch.no_grad()

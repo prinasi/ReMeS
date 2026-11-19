@@ -218,7 +218,8 @@ def prefilter_pyramid(env: torch.Tensor, levels, chunk: int = 2048) -> list[torc
 
 # ----------------------------------------------------------------------- shading
 def shade(albedo, rough, metal, n, v, vis, light: EnvLight, lut: torch.Tensor,
-          specular_occlusion: bool = True, layering: bool = True, irr_extra: torch.Tensor | None = None) -> dict:
+          specular_occlusion: bool = True, layering: bool = True, irr_extra: torch.Tensor | None = None,
+          occluded=None) -> dict:
     """Outgoing linear radiance for N points.
 
     albedo [N,3], rough [N], metal [N], n (unit shading normal) [N,3],
@@ -226,6 +227,8 @@ def shade(albedo, rough, metal, n, v, vis, light: EnvLight, lut: torch.Tensor,
     layering: attenuate diffuse by the specular layer's directional albedo (F0·A + B),
     as Blender's Principled BSDF (v2) does for energy conservation (Phase 5 parity).
     irr_extra [N,3]: additional diffuse irradiance (Phase 4 one-bounce indirect, relight/indirect.py).
+    occluded: callable ŵ [N,K] -> [N,3], radiance arriving from the blocked part of the specular lobe
+    (normalised lobe weights ŵ; relight/interreflect.py). None = blocked directions are black.
     """
     cos = (n @ light.dirs.T).clamp_min(0)                               # [N, K]
     irradiance = (vis * cos) @ light.bins                               # [N, 3]
@@ -246,6 +249,9 @@ def shade(albedo, rough, metal, n, v, vis, light: EnvLight, lut: torch.Tensor,
         cos_r = refl @ light.dirs.T
         cos_h = torch.sqrt(((1 + cos_r) / 2).clamp_min(1e-8))            # finite gradient at grazing angles
         w = ggx_d(cos_h, (rough * rough).clamp_min(1e-3)[:, None]) * cos_r.clamp_min(0) + 1e-8
-        so = (vis * w).sum(-1) / w.sum(-1)
+        wn = w / w.sum(-1, keepdim=True)
+        so = (vis * wn).sum(-1)
         spec = spec * so[:, None]
+        if occluded is not None:
+            spec = spec + spec_albedo * occluded(wn)
     return {"rgb": diffuse + spec, "diffuse": diffuse, "specular": spec, "irradiance": irradiance}

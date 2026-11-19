@@ -60,12 +60,13 @@ def surface_point(mesh, face_id, bary):
 
 
 @torch.no_grad()
-def build_pixel_cache(mesh, ds: Synthetic4Relight, alpha_thr: float) -> dict:
-    """All interior foreground pixels of all training views (face, bary, camera, GT linear rgb)."""
+def build_pixel_cache(mesh, ds: Synthetic4Relight, alpha_thr: float, views=None) -> dict:
+    """All interior foreground pixels of all training views (face, bary, camera, GT linear rgb).
+    views: preloaded ds.train_view(i) list (Phase 6 re-caches), else loaded here."""
     fids, barys, cams, rgbs, centers, index = [], [], [], [], [], []
     offset = 0
     for i in range(ds.num_views("train")):
-        v = ds.train_view(i)
+        v = ds.train_view(i) if views is None else views[i]
         g = rasterize(mesh, v.camera)
         sel = g["mask"] & (torch.from_numpy(v.mask).cuda() >= alpha_thr)
         sel[:SKIP_TOP_ROWS] = False
@@ -86,7 +87,9 @@ def build_pixel_cache(mesh, ds: Synthetic4Relight, alpha_thr: float) -> dict:
 LAYERING = True   # set from --no-layering in main()
 
 
-def shade_points(mesh, mat, vis_packed, light, lut, face_id, bary, cam_pos, so=True, albedo_scale=None, e_ind=None):
+def shade_points(mesh, mat, vis_packed, light, lut, face_id, bary, cam_pos, so=True, albedo_scale=None, e_ind=None,
+                 occluded=None):
+    """occluded: Interreflection.occluded(...) callable (face_id, bary, ŵ) -> blocked-lobe radiance, or None."""
     n = shading_normal(mesh, face_id, bary, mat)
     x = surface_point(mesh, face_id, bary)
     v = F.normalize(cam_pos - x, dim=-1)
@@ -95,8 +98,9 @@ def shade_points(mesh, mat, vis_packed, light, lut, face_id, bary, cam_pos, so=T
         m["albedo"] = (m["albedo"] * albedo_scale).clamp(0, 1)
     vis = interpolate_visibility(vis_packed, mesh.faces, face_id, bary)
     extra = None if e_ind is None else interpolate_vertex(e_ind, mesh.faces, face_id, bary)
+    occ = None if occluded is None else (lambda wn: occluded(face_id, bary, wn))
     out = shade(m["albedo"], m["rough"], m["metal"], n, v, vis, light, lut, specular_occlusion=so,
-                layering=LAYERING, irr_extra=extra)
+                layering=LAYERING, irr_extra=extra, occluded=occ)
     out.update(m)
     return out
 
@@ -192,8 +196,10 @@ def loss_space(x):
 # ----------------------------------------------------------------------------- eval
 @torch.no_grad()
 def render_view(mesh, mat, vis_packed, light, lut, cam, chunk=1 << 16, so=True, albedo_scale=None, indirect=None):
-    """indirect: relight.indirect.IndirectLight (Phase 4) or None (direct light only)."""
+    """indirect: relight.indirect.IndirectLight (Phase 4), relight.interreflect.Interreflection (multi-bounce
+    diffuse + specular interreflection) or None (direct light only)."""
     e_ind = None if indirect is None else indirect.irradiance(mat, light, albedo_scale)
+    occluded = indirect.occluded(light, albedo_scale) if hasattr(indirect, "occluded") else None
     g = rasterize(mesh, cam)
     m = g["mask"]
     fid, bary = g["face_id"][m], g["bary"][m]
@@ -204,7 +210,7 @@ def render_view(mesh, mat, vis_packed, light, lut, cam, chunk=1 << 16, so=True, 
     outs = {k: [] for k in img}
     for s in range(0, fid.shape[0], chunk):
         o = shade_points(mesh, mat, vis_packed, light, lut, fid[s:s + chunk], bary[s:s + chunk], cpos, so,
-                         albedo_scale, e_ind)
+                         albedo_scale, e_ind, occluded)
         for k in img:
             outs[k].append(o[k] if o[k].ndim == 2 else o[k][:, None])
     for k in img:
@@ -331,6 +337,46 @@ def evaluate(mesh, mat, vis_packed, lights, train_light, lut, ds, stride, img_di
     return res
 
 
+def make_indirect(mesh, vis_packed, dirs, model: Path | None, n_dirs: int, vis_tmin: float, lut, interreflect=False,
+                  bounces: int = 3, so: bool = True, h: float | None = None):
+    """Phase 4 one-bounce diffuse transport, optionally wrapped in the multi-bounce interreflection cache.
+    model = cache directory (None: build without disk caches, Phase 6 re-caches); h = ray offset scale."""
+    from relight.indirect import IndirectLight, blocked_hits
+    from relight.visibility import median_edge_length
+    h = median_edge_length(mesh) if h is None else h
+    eps, tmin = 0.5 * h, vis_tmin * h
+    if model is None:
+        ind = IndirectLight.build(mesh, vis_packed, dirs, eps=eps, tmin=tmin)
+    else:
+        ind = IndirectLight.cached(mesh, vis_packed, dirs, model / f"indirect_K{n_dirs}_t{vis_tmin:g}.pt",
+                                   eps=eps, tmin=tmin)
+    if not interreflect:
+        return ind
+    from relight.interreflect import Interreflection
+
+    def shade_fn(mat, light, scale, fid, bary, cam, e_vert, occl):
+        return shade_points(mesh, mat, vis_packed, light, lut, fid, bary, cam, so, scale, e_vert, occl)["rgb"]
+    if model is None:
+        return Interreflection(ind, mesh, blocked_hits(mesh, vis_packed, dirs, eps, tmin), dirs, shade_fn,
+                               bounces=bounces)
+    return Interreflection.cached(ind, mesh, vis_packed, dirs, model / f"hits_K{n_dirs}_t{vis_tmin:g}.pt",
+                                  eps=eps, tmin=tmin, shade_fn=shade_fn, bounces=bounces)
+
+
+@torch.no_grad()
+def mean_albedo_scale(mesh, mat, ds, stride) -> torch.Tensor:
+    """Mean over test views of the per-view per-channel albedo alignment scale (as in evaluate())."""
+    sc = []
+    for i in range(0, ds.num_views("test"), stride):
+        tv = ds.test_view(i)
+        g = rasterize(mesh, tv.camera)
+        m = g["mask"] & (torch.from_numpy(tv.mask).cuda() > 0.5)
+        p = mat.sample(g["face_id"][m], g["bary"][m])["albedo"]
+        gt = gamma_to_linear(torch.from_numpy(tv.albedo).cuda())[m]
+        sc.append((p * gt).sum(0) / (p * p).sum(0).clamp_min(1e-8))
+    return torch.stack(sc).mean(0)
+
+
 # ----------------------------------------------------------------------------- main
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -377,6 +423,23 @@ def main():
     p.add_argument("--indirect", action=argparse.BooleanOptionalAction, default=True,
                    help="Phase 4: one-bounce indirect diffuse light from the mesh itself (relight/indirect.py); "
                         "--no-indirect = direct light only")
+    p.add_argument("--interreflect", action=argparse.BooleanOptionalAction, default=True,
+                   help="multi-bounce interreflection (relight/interreflect.py): blocked specular lobes and the "
+                        "light leaving hit points use a radiance cache of the full model (default on; "
+                        "--no-interreflect = Phase 4 one-bounce diffuse only)")
+    p.add_argument("--ir-every", type=int, default=100, help="training: refresh the radiance cache every N its")
+    p.add_argument("--ir-bounces", type=int, default=3, help="evaluation: cache refreshes (bounces) per light")
+    p.add_argument("--joint", action="store_true",
+                   help="Phase 6: also refine the vertices (relight/joint.py); the refined mesh is saved to <out>")
+    p.add_argument("--joint-from", type=int, default=500, help="start moving vertices at this iteration")
+    p.add_argument("--lr-geo", type=float, default=1e-4)
+    p.add_argument("--geo-lap", type=float, default=50.0, help="Laplacian of the displacement")
+    p.add_argument("--geo-anchor", type=float, default=1.0, help="|displacement|^2")
+    p.add_argument("--geo-sil", type=float, default=1.0, help="silhouette (soft mask) loss weight")
+    p.add_argument("--sil-views", type=int, default=2, help="silhouette views per iteration")
+    p.add_argument("--geo-large-steps", type=float, default=0.0, help="lambda of relight/largesteps.py (0 = Adam)")
+    p.add_argument("--recache-every", type=int, default=500,
+                   help="re-rasterise the pixel cache and rebuild visibility / transport every N geometry its")
     p.add_argument("--indirect-grad", action="store_true",
                    help="let the indirect term's gradient reach the albedo at the hit points (default: detached)")
     p.add_argument("--no-layering", action="store_true",
@@ -398,38 +461,45 @@ def main():
     out_dir = model / a.out
     (out_dir / "images").mkdir(parents=True, exist_ok=True)
     mesh = load_relight_mesh(model)
+    from relight.visibility import median_edge_length
+    h_ray = median_edge_length(mesh)                   # ray offsets (kept fixed through Phase 6 re-caches)
+    cache_dir = model
+    if a.joint and a.eval_only and (out_dir / "relight_mesh.pt").is_file():
+        mesh, cache_dir = load_relight_mesh(out_dir), out_dir          # refined mesh of a Phase 6 run
     ds = Synthetic4Relight(a.data, a.scene)
     dirs = fibonacci_sphere(a.dirs)
 
+    def visibility(m, path):
+        if a.no_visibility:
+            from relight.visibility import pack_bits
+            return pack_bits((m.vertex_normals @ dirs.T) > 0)
+        if path is None:
+            from relight.visibility import vertex_visibility
+            return vertex_visibility(m, dirs, eps=0.5 * h_ray, tmin=a.vis_tmin * h_ray)
+        return cached_vertex_visibility(m, dirs, path, eps=0.5 * h_ray, tmin=a.vis_tmin * h_ray)
+
     # visibility (cached next to the mesh; geometry is frozen)
     tv = time.perf_counter()
-    if a.no_visibility:
-        from relight.visibility import pack_bits
-        vis_packed = pack_bits((mesh.vertex_normals @ dirs.T) > 0)
-    else:
-        from relight.visibility import median_edge_length
-        h = median_edge_length(mesh)
-        vis_packed = cached_vertex_visibility(mesh, dirs, model / f"visibility_K{a.dirs}_t{a.vis_tmin:g}.pt",
-                                              eps=0.5 * h, tmin=a.vis_tmin * h)
+    vis_packed = visibility(mesh, cache_dir / f"visibility_K{a.dirs}_t{a.vis_tmin:g}.pt")
     indirect = None
+    lut = brdf_lut()
     if a.indirect:
-        from relight.indirect import IndirectLight
-        from relight.visibility import median_edge_length
-        h = median_edge_length(mesh)
         ti = time.perf_counter()
-        indirect = IndirectLight.cached(mesh, vis_packed, dirs, model / f"indirect_K{a.dirs}_t{a.vis_tmin:g}.pt",
-                                        eps=0.5 * h, tmin=a.vis_tmin * h)
+        indirect = make_indirect(mesh, vis_packed, dirs, cache_dir, a.dirs, a.vis_tmin, lut, a.interreflect,
+                                 a.ir_bounces, so=not a.no_so, h=h_ray)
         print(f"[indirect] transport {indirect.stats()} ({time.perf_counter() - ti:.1f}s)", flush=True)
+    else:
+        a.interreflect = False                         # interreflection builds on the Phase 4 transport
     from relight.visibility import unpack_bits
     above = (mesh.vertex_normals @ dirs.T) > 0
     occl = 1 - unpack_bits(vis_packed).float().sum() / above.float().sum()
     print(f"[vis] {mesh.vertices.shape[0]:,} vertices x {a.dirs} dirs, {time.perf_counter() - tv:.1f}s, "
           f"occluded share of upper hemisphere {100 * occl:.1f}%")
 
-    lut = brdf_lut()
     names = sorted({a.light, TRAIN_ENVMAP, *RELIGHT_ENVMAPS})
     lights = {n: EnvLight(load_envmap(ds.envmap_path(n)), dirs, n) for n in names}
-    cache = build_pixel_cache(mesh, ds, a.alpha_thr)
+    train_views = [ds.train_view(i) for i in range(ds.num_views("train"))] if a.joint and not a.eval_only else None
+    cache = build_pixel_cache(mesh, ds, a.alpha_thr, train_views)
     P = cache["face_id"].shape[0]
     print(f"[data] {P:,} interior foreground pixels from {ds.num_views('train')} views")
 
@@ -456,7 +526,7 @@ def main():
         alb0, seen = init_albedo(mesh, vis_packed, light, cache)
         if indirect is not None:                     # one fixed-point step: re-estimate with the bounce light
             with torch.no_grad():
-                e0 = indirect.M @ (alb0 / math.pi * indirect.direct_irradiance(light))
+                e0 = indirect.M @ (alb0 / math.pi * indirect.direct_irradiance(light).float())
             alb0, seen = init_albedo(mesh, vis_packed, light, cache, e_ind=e0)
         print(f"[init] data-driven albedo for {100 * seen:.1f}% of vertices, mean {alb0.mean(0).tolist()}")
     else:
@@ -479,6 +549,22 @@ def main():
         print(f"[smooth] edge-aware weights sigma {a.edge_aware}: mean {float(edge_w.mean()):.3f}, "
               f"share < 0.5: {float((edge_w < 0.5).float().mean()):.3f}")
 
+    geo = geo_opt = geo_ls = None
+    if a.joint and not a.eval_only:
+        import random
+        from relight.gbuffer import mvp_matrix
+        from relight.joint import JointGeometry
+        geo = JointGeometry(mesh, edges).cuda()
+        sil_views = [(mvp_matrix(v.camera).cuda(), torch.from_numpy(v.mask).float().cuda(),
+                      [v.camera.height, v.camera.width]) for v in train_views]
+        if a.geo_large_steps > 0:
+            from relight.largesteps import LargeSteps
+            geo_ls = LargeSteps(mesh.vertices.shape[0], edges, lam=a.geo_large_steps, lr=a.lr_geo)
+        else:
+            geo_opt = torch.optim.Adam([geo.D], lr=a.lr_geo)
+        print(f"[joint] vertex refinement from it {a.joint_from}, lr {a.lr_geo}, lap {a.geo_lap}, "
+              f"sil {a.geo_sil}, re-cache every {a.recache_every}", flush=True)
+
     log = []
     if a.eval_only:
         ck = torch.load(out_dir / "material.pt", map_location="cuda", weights_only=False)
@@ -488,6 +574,22 @@ def main():
         prev = out_dir / "metrics.json"
         log = json.loads(prev.read_text()).get("train_log", []) if prev.is_file() else []
     for it in range(1, 0 if a.eval_only else a.iters + 1):
+        geo_on = geo is not None and it >= a.joint_from
+        force_ir = False
+        if geo_on and it > a.joint_from and (it - a.joint_from) % a.recache_every == 0:
+            tr = time.perf_counter()
+            with torch.no_grad():                          # rebuild ray queries + pixel correspondences
+                snap = geo.snapshot()
+                vis_packed = visibility(snap, None)
+                if a.indirect:
+                    indirect = make_indirect(snap, vis_packed, dirs, None, a.dirs, a.vis_tmin, lut, a.interreflect,
+                                             a.ir_bounces, so=not a.no_so, h=h_ray)
+                cache = build_pixel_cache(snap, ds, a.alpha_thr, train_views)
+                P = cache["face_id"].shape[0]
+            force_ir = True
+            print(f"[joint] it {it}: re-cache ({time.perf_counter() - tr:.1f}s), {P:,} pixels, |D| mean "
+                  f"{float(geo.D.norm(dim=-1).mean()):.5f} max {float(geo.D.norm(dim=-1).max()):.4f}", flush=True)
+        cur = geo.mesh() if geo_on else mesh
         if a.ssim > 0:                                    # patch batches (SSIM needs image structure)
             idx, patch_idx = sample_patches(cache, a.patches, a.patch_size)
         else:
@@ -496,8 +598,14 @@ def main():
         cpos = cache["centers"][cache["cam"][idx].long()]
         if a.learn_light:
             light.refresh()
+        occluded = None
+        if a.interreflect and (it == 1 or it % a.ir_every == 0 or force_ir):
+            indirect.refresh(mat, light, bounces=1)       # progressive: one more bounce per refresh
         e_ind = None if indirect is None else indirect.irradiance(mat, light, detach_material=not a.indirect_grad)
-        o = shade_points(mesh, mat, vis_packed, light, lut, fid, bary, cpos, so=not a.no_so, e_ind=e_ind)
+        if a.interreflect:
+            occluded = indirect.occluded(light)
+        o = shade_points(cur, mat, vis_packed, light, lut, fid, bary, cpos, so=not a.no_so, e_ind=e_ind,
+                         occluded=occluded)
         l_img = (loss_space(o["rgb"]) - loss_space(cache["rgb"][idx].float())).abs().mean()
         if a.ssim > 0:
             l_img = (1 - a.ssim) * l_img + a.ssim * patch_dssim(loss_space(o["rgb"]),
@@ -507,19 +615,52 @@ def main():
         loss = l_img + l_smooth
         if a.learn_light:
             loss = loss + a.light_tv * light.tv() + a.light_wb * light.white_balance()
+        l_sil = torch.zeros((), device="cuda")
+        if geo_on:
+            l_sil = geo.silhouette_loss(cur.vertices, random.sample(sil_views, a.sil_views), SKIP_TOP_ROWS)
+            loss = loss + a.geo_sil * l_sil + geo.regulariser(a.geo_lap, a.geo_anchor)
         opt.zero_grad(set_to_none=True)
+        if geo_opt is not None:
+            geo_opt.zero_grad(set_to_none=True)
         loss.backward()
         opt.step()
         sched.step()
+        if geo_on:
+            lr_g = a.lr_geo * 0.1 ** ((it - a.joint_from) / max(a.iters - a.joint_from, 1))
+            if geo_opt is not None:
+                geo_opt.param_groups[0]["lr"] = lr_g
+                geo_opt.step()
+            else:
+                geo_ls.lr = lr_g
+                geo_ls.step(geo.D)
         if it % 250 == 0 or it == 1:
             with torch.no_grad():
                 pp = -10 * math.log10(((tonemap(o["rgb"]) - tonemap(cache["rgb"][idx].float())) ** 2).mean().item())
-            log.append({"iter": it, "loss": l_img.item(), "smooth": float(l_smooth), "train_psnr": pp})
+            log.append({"iter": it, "loss": l_img.item(), "smooth": float(l_smooth), "train_psnr": pp,
+                        "sil": float(l_sil)})
             print(f"[train] it {it:5d}  L1 {l_img.item():.5f}  smooth {float(l_smooth):.5f}  "
-                  f"batch PSNR {pp:.2f}  ({time.perf_counter() - t0:.0f}s)", flush=True)
+                  f"batch PSNR {pp:.2f}{f'  sil {float(l_sil):.6f}' if geo_on else ''}  "
+                  f"({time.perf_counter() - t0:.0f}s)", flush=True)
 
     if not a.eval_only:
         torch.save({"state_dict": mat.state_dict(), "args": vars(a)}, out_dir / "material.pt")
+    geo_metrics = {}
+    if geo is not None:                                   # Phase 6: evaluate / export the refined mesh
+        from relight.mesh import save_relight_mesh
+        mesh = geo.snapshot()
+        dn = geo.D.detach().norm(dim=-1)
+        from relight.orient import vertex_normals
+        n0 = vertex_normals(geo.V0, geo.faces)
+        nd = torch.rad2deg(torch.acos((mesh.vertex_normals * n0).sum(-1).clamp(-1, 1)))
+        geo_metrics = {"geo_disp_mean": float(dn.mean()), "geo_disp_max": float(dn.max()),
+                       "geo_disp_mean_rel_edge": float(dn.mean()) / h_ray, "geo_normal_change_median": float(nd.median())}
+        print(f"[joint] {geo_metrics}", flush=True)
+        save_relight_mesh(mesh, out_dir / "relight_mesh.pt", {"stage": "phase6_joint", "source": str(model)})
+        cache_dir = out_dir
+        vis_packed = visibility(mesh, cache_dir / f"visibility_K{a.dirs}_t{a.vis_tmin:g}.pt")
+        if a.indirect:
+            indirect = make_indirect(mesh, vis_packed, dirs, cache_dir, a.dirs, a.vis_tmin, lut, a.interreflect,
+                                     a.ir_bounces, so=not a.no_so, h=h_ray)
     light_metrics = {}
     if a.learn_light:
         with torch.no_grad():
@@ -536,10 +677,18 @@ def main():
         if not a.eval_only:
             torch.save({"log_env": light.log_env.detach().cpu()}, out_dir / "light.pt")
     te = time.perf_counter()
+    if a.interreflect:                                    # rebuild the cache for the final material, per light
+        indirect.clear()
+        indirect.bind(mat)
+        indirect.aligned_scale = mean_albedo_scale(mesh, mat, ds, a.eval_stride)
+        tr = time.perf_counter()
+        indirect.refresh(mat, light, bounces=a.ir_bounces)
+        print(f"[interreflect] {a.ir_bounces} bounces in {time.perf_counter() - tr:.1f}s", flush=True)
     with torch.no_grad():
         metrics = evaluate(mesh, mat, vis_packed, lights, light, lut, ds, a.eval_stride, out_dir / "images",
                            so=not a.no_so, indirect=indirect, ss=a.eval_ss)
     metrics.update(light_metrics)
+    metrics.update(geo_metrics)
     metrics.update(seconds_total=time.perf_counter() - t0, seconds_eval=time.perf_counter() - te,
                    args=vars(a), occluded_share=float(occl), train_log=log)
     (out_dir / "metrics.json").write_text(json.dumps(metrics, indent=2))

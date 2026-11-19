@@ -788,3 +788,59 @@ scripts/oto_real.sh` (these two are now the `train_oto.py` defaults). Learned li
 Blender (masked): learned light Cycles GI vs GT 27.06 / 27.18 (v8 27.07 / 27.11), parity 32.44 / 34.43 (v8 31.95 /
 33.41); oracle light Cycles GI vs GT 27.83 / 28.29 (v6 oracle + indirect: 27.29 / 27.57). The Stage-B textures'
 silhouette benefit largely overlaps with the silhouette refinement (+0.2 dB NVS on top of it, vs ≈ +1 dB without).
+
+### Matched oracle, specular interreflection, Phase 6 (2026-11-19)
+
+Priorities set after v9: physical correctness (relighting, albedo, roughness MSE, Blender) over NVS; complete the
+model (interreflection, Phase 6) before testing on further benchmarks.
+
+**Matched oracle.** The earlier oracle-light row used the old Phase 2 settings (no face textures / learned normals /
+SSIM). With the learned-light settings and the GT light (`pbr_oracle_matched`), four-scene means:
+
+| v9 | NVS PSNR / SSIM / LPIPS | Relight PSNR / SSIM / LPIPS | Albedo PSNR / SSIM / LPIPS | Rough MSE | Cycles GI vs GT | ReMeS vs GT | Parity |
+|---|---|---|---|---|---|---|---|
+| learned light | 36.12 / 0.980 / 0.044 | 34.61 / 0.973 / 0.057 | 30.04 / 0.953 / 0.068 | 0.0106 | 27.12 | 27.32 | 33.44 |
+| learned light + interreflection | **36.37** / 0.980 / 0.043 | **35.04** / 0.973 / 0.057 | **30.18** / 0.954 / 0.066 | **0.0097** | 27.15 | 27.68 | 33.46 |
+| oracle light (matched) | 35.89 / 0.980 / 0.043 | 35.53 / 0.974 / 0.055 | 31.25 / 0.955 / 0.062 | 0.0107 | 28.35 | 28.26 | 33.30 |
+| oracle light + interreflection | 36.08 / 0.980 / 0.042 | **36.03 / 0.975 / 0.054** | **31.31 / 0.956 / 0.060** | **0.0092** | **28.48** | **28.77** | 33.32 |
+
+(Blender columns: masked, mean of envmap6/12.) Light estimation costs ≈ 0.9–1.0 dB relighting, 1.1–1.2 dB albedo and
+1.2–1.3 dB Cycles; roughness is unaffected by it.
+
+**Specular interreflection** (`relight/interreflect.py`, `train_pbr.py --interreflect`, now the default;
+`tests/test_interreflect.py`). The Phase 4 rays of every blocked direction above each vertex are kept as hit records
+(vertex, direction, hit face, barycentrics; ≈ 5.5 M per scene). A refresh shades all hit points with the full model —
+diffuse with the current indirect irradiance plus split-sum specular evaluated toward the receiver (view = −w_k),
+with their own blocked lobe filled from the previous cache — into a dense radiance cache L_in [V, K, 3] (half,
+≈ 290 MB). Each refresh adds a bounce (training: every 100 its; evaluation: 3 per light). Uses: (1) the blocked part
+of each specular lobe, black under specular occlusion so far, receives Σ (1−V_k) ŵ_k L_in (ŵ = the SO lobe weights,
+differentiable w.r.t. roughness / normals); (2) diffuse indirect becomes multi-bounce and includes glossy hits, as
+the differentiable one-bounce M·B plus a detached correction. ≈ 2.3 s per refresh, +2–3 min per scene.
+Per scene (oracle / learned light): relighting +1.0 / +0.9 dB (air_baloons), +0.5 / +0.3 (jugs), +0.3 / +0.4 (hotdog),
++0.2 / +0.2 (chair); roughness MSE air_baloons 0.0073 → 0.0033, hotdog 0.0213 → 0.0183 (oracle), chair slightly
+worse (0.0096 → 0.0107); ReMeS vs GT +0.4–0.5 dB (our renderer explains more of Cycles' full GI); learned light
+PSNR 16.5 → 17.1.
+
+**Phase 6, joint vertex + material refinement** (`relight/joint.py`, `train_pbr.py --joint`, off by default):
+V = V0 + D with the image loss (gradient through vertex normals, SO lobe, view direction), an antialiased soft-mask
+silhouette loss on 2 views / it, Laplacian of D and an anchor; pixels keep their (face, bary) correspondence and
+pixel cache, visibility, transport and hit records are rebuilt every 500 its; the refined mesh is saved to the run
+directory (`eval_blender.py` uses it). SynthGeo (GT geometry, `output/oto/capB_ft8`, oracle light + interreflection):
+
+| | Textured face / smooth normal err | acc. median / mean | relight | Glossy face / smooth | acc. median / mean | relight |
+|---|---|---|---|---|---|---|
+| frozen | 2.01 / 1.76° | 0.0063 / 0.0276 | 38.16 | 2.57 / 2.33° | 0.0250 / 0.0746 | 37.34 |
+| joint, Adam 1e-4 | 3.94 / 2.50° | 0.0141 / 0.0347 | 37.63 | 3.63 / 2.36° | 0.0219 / 0.0720 | 37.30 |
+| joint, no learned normals | 3.95 / 2.50° | 0.0142 / 0.0347 | 37.36 | 4.19 / 2.47° | 0.0229 / 0.0728 | 37.04 |
+| joint, large steps 3e-3 | 2.13 / 1.87° | 0.0161 / 0.0368 | 37.85 | 2.50 / 2.25° | 0.0318 / 0.0781 | 36.84 |
+| joint, large steps 1e-2 | 2.58 / 2.27° | 0.0235 / 0.0467 | 37.66 | 2.63 / 2.35° | 0.0353 / 0.0829 | 36.59 |
+
+jugs (learned light): relighting 38.51 → 38.44, roughness 0.0062 → 0.0067, Cycles GI 29.17 → 28.92.
+* Negative result. Per-coordinate Adam turns the incoherent per-vertex shading-normal gradients (cf. the gradient
+  diagnostic) into a random walk (normal error ×2); large steps removes the jitter but the surface drifts in depth.
+* Cause: with fixed pixel correspondences the only geometry signal is the normal — there is no parallax, so depth is
+  constrained only by the silhouettes and the regularisers. A proper Phase 6 has to re-rasterise every iteration
+  with gradients through the texture lookup (what Stage B does), i.e. move the PBR material model (per-face
+  textures, interreflection) into Stage B rather than add vertex updates to the material stage. Expected gain is
+  small: on SynthGeo the remaining geometry errors are observability (slab height) and undercuts, which the
+  image loss does not constrain.
