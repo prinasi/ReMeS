@@ -363,6 +363,78 @@ def make_indirect(mesh, vis_packed, dirs, model: Path | None, n_dirs: int, vis_t
                                   eps=eps, tmin=tmin, shade_fn=shade_fn, bounces=bounces)
 
 
+class OrientationPrior:
+    """Weighted variance of the part of per-vertex log-albedo that a degree-2 SH function of the vertex normal
+    explains (constant term excluded). Ground-truth Synthetic4Relight albedo has R² 0.03-0.09 for such a fit,
+    whereas an unknown light lets weakly observed directions trade light against the albedo of the surfaces
+    facing them (e.g. down-facing albedo 37 % too dark on chair with a learned light)."""
+
+    def __init__(self, normals: torch.Tensor, weights: torch.Tensor):
+        n = normals
+        X = torch.stack([torch.ones_like(n[:, 0]), n[:, 0], n[:, 1], n[:, 2], n[:, 0] * n[:, 1], n[:, 1] * n[:, 2],
+                         n[:, 0] * n[:, 2], n[:, 0] ** 2 - n[:, 1] ** 2, 3 * n[:, 2] ** 2 - 1], -1)
+        w = weights / weights.sum()
+        self.X, self.w = X, w[:, None]
+        A = X.T @ (self.w * X) + 1e-6 * torch.eye(9, device=X.device)
+        self.P = torch.linalg.solve(A, (self.w * X).T)                  # [9, V]: weighted LSQ projector
+
+    def __call__(self, albedo: torch.Tensor) -> torch.Tensor:
+        a = torch.log(albedo.clamp_min(1e-3))
+        fit = self.X[:, 1:] @ (self.P[1:] @ a)                          # non-constant fitted part [V, 3]
+        mean = (self.w * fit).sum(0, keepdim=True)
+        return (self.w * (fit - mean) ** 2).sum(0).mean()
+
+
+@torch.no_grad()
+def vertex_observations(mesh, cache, chunk=1 << 20) -> torch.Tensor:
+    """Barycentric pixel count per vertex over the training pixel cache."""
+    cnt = torch.zeros(mesh.vertices.shape[0], device="cuda")
+    for s in range(0, cache["face_id"].shape[0], chunk):
+        tri = mesh.faces[cache["face_id"][s:s + chunk].long()].long()
+        b = cache["bary"][s:s + chunk]
+        for k in range(3):
+            cnt.index_add_(0, tri[:, k], b[:, k])
+    return cnt
+
+
+def load_or_make_uv(mesh, cache_dir: Path, method: str = "xatlas", res: int = 4096) -> torch.Tensor:
+    """Per-corner UVs [F, 3, 2], cached in <cache_dir>. 'xatlas': xatlas charts + packing for a res x res atlas with
+    2-texel padding (~80 % utilisation); 'blender': Smart UV Project + concave packing (relight/blender/uv_unwrap.py,
+    ~50 %)."""
+    import subprocess
+    if method == "xatlas":
+        path = cache_dir / f"uv_xatlas_{res}.npz"
+        if not path.is_file():
+            import xatlas
+            t = time.perf_counter()
+            F_ = mesh.faces.cpu().numpy().astype(np.uint32)
+            at = xatlas.Atlas()
+            at.add_mesh(mesh.vertices.cpu().numpy(), F_)
+            po = xatlas.PackOptions()
+            po.padding, po.resolution, po.bilinear = 2, res, True
+            at.generate(xatlas.ChartOptions(), po)
+            vmap, idx, uv_ = at[0]
+            assert (vmap[idx] == F_).all(), "xatlas changed the face order"
+            np.savez(path, uv=uv_[idx].astype(np.float32), charts=at.chart_count, uv_area=at.utilization)
+            print(f"[atlas] xatlas: {at.chart_count} charts, utilisation {at.utilization:.3f} "
+                  f"({time.perf_counter() - t:.0f}s)")
+        d = np.load(path)
+        return torch.from_numpy(d["uv"]).cuda()
+    path = cache_dir / "uv_smart.npz"
+    if not path.is_file():
+        src = cache_dir / "uv_mesh_tmp.npz"
+        np.savez(src, vertices=mesh.vertices.cpu().numpy(), faces=mesh.faces.cpu().numpy())
+        r = subprocess.run([sys.executable, "-m", "relight.blender.uv_unwrap", "--mesh", str(src), "--out", str(path)],
+                           cwd=ROOT, capture_output=True, text=True)
+        src.unlink()
+        if r.returncode != 0:
+            raise RuntimeError(f"UV unwrap failed:\n{r.stdout[-2000:]}\n{r.stderr[-2000:]}")
+        print(f"[atlas] UV unwrap {r.stdout.strip().splitlines()[-1]}")
+    d = np.load(path)
+    assert d["uv"].shape[0] == mesh.faces.shape[0]
+    return torch.from_numpy(d["uv"]).cuda()
+
+
 @torch.no_grad()
 def mean_albedo_scale(mesh, mat, ds, stride) -> torch.Tensor:
     """Mean over test views of the per-view per-channel albedo alignment scale (as in evaluate())."""
@@ -394,6 +466,18 @@ def main():
     p.add_argument("--lr-light", type=float, default=2e-2)
     p.add_argument("--light-tv", type=float, default=1e-3, help="TV on the log envmap")
     p.add_argument("--light-wb", type=float, default=0.0, help="white-balance prior on the mean light colour")
+    p.add_argument("--light-sat", type=float, default=0.0,
+                   help="low-saturation prior: variance of the light's log-chroma across directions")
+    p.add_argument("--orient-prior", type=float, default=None,
+                   help="albedo-orientation decorrelation: penalise the share of log-albedo explained by a degree-2 "
+                        "SH function of the normal (the light/albedo gauge mode: brighter light from some directions "
+                        "<-> darker albedo on surfaces facing them); weighted by vertex observations. "
+                        "Default 0.1 with --learn-light, 0 with a known light (no ambiguity)")
+    p.add_argument("--warmup", type=int, default=0,
+                   help="light warm-up iterations: albedo smoothness x --warmup-smooth and light lr x "
+                        "--warmup-lr-mult, so the light (not the albedo) has to explain orientation-dependent shading")
+    p.add_argument("--warmup-smooth", type=float, default=20.0)
+    p.add_argument("--warmup-lr-mult", type=float, default=4.0)
     p.add_argument("--dirs", type=int, default=512, help="visibility / light directions")
     p.add_argument("--iters", type=int, default=3000)
     p.add_argument("--batch", type=int, default=1 << 17)
@@ -401,6 +485,11 @@ def main():
     p.add_argument("--albedo-init", default="data", help="'data' (radiance / irradiance) or a constant")
     p.add_argument("--lr-final-ratio", type=float, default=0.1)
     p.add_argument("--face-res", type=int, default=0, help="per-face residual texture res (0 = off)")
+    p.add_argument("--atlas-res", type=int, default=0,
+                   help="shared UV atlas residual texture resolution (0 = off; Blender Smart UV Project, cached as "
+                        "<model>/uv_smart.npz); exclusive with --face-res")
+    p.add_argument("--uv-method", default="xatlas", choices=["xatlas", "blender"])
+    p.add_argument("--atlas-smooth", type=float, default=0.0, help="texture-space smoothness of the atlas residual")
     p.add_argument("--smooth-albedo", type=float, default=0.005)
     p.add_argument("--smooth-rough", type=float, default=0.02)
     p.add_argument("--learn-metallic", action="store_true")
@@ -450,6 +539,8 @@ def main():
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--eval-only", action="store_true", help="reload <out>/material.pt (+ light.pt) and re-evaluate")
     a = p.parse_args()
+    if a.orient_prior is None:
+        a.orient_prior = 0.1 if a.learn_light else 0.0
     global LAYERING
     LAYERING = not a.no_layering
     torch.manual_seed(a.seed)
@@ -531,10 +622,15 @@ def main():
         print(f"[init] data-driven albedo for {100 * seen:.1f}% of vertices, mean {alb0.mean(0).tolist()}")
     else:
         alb0 = float(a.albedo_init)
+    uv = load_or_make_uv(mesh, cache_dir, a.uv_method, a.atlas_res) if a.atlas_res > 0 else None
     mat = PBRMaterial(mesh.faces, mesh.vertices.shape[0], face_res=a.face_res, albedo_init=alb0,
-                      learn_metallic=a.learn_metallic, learn_normals=a.learn_normals).cuda()
+                      learn_metallic=a.learn_metallic, learn_normals=a.learn_normals,
+                      atlas_res=a.atlas_res, uv=uv).cuda()
+    if mat.atlas is not None:
+        mat.atlas_cover.copy_(mat.uv_raster()[0] >= 0)
+        print(f"[atlas] {a.atlas_res}^2 residual, coverage {float(mat.atlas_cover.float().mean()):.3f}")
     params = [mat.albedo, mat.rough] + ([mat.metal] if a.learn_metallic else []) + \
-             ([mat.residual] if mat.residual is not None else [])
+             ([mat.residual] if mat.residual is not None else []) + ([mat.atlas] if mat.atlas is not None else [])
     groups = [{"params": params, "lr": a.lr}]
     if mat.normal_offset is not None:
         groups.append({"params": [mat.normal_offset], "lr": a.lr_normal})
@@ -564,6 +660,8 @@ def main():
             geo_opt = torch.optim.Adam([geo.D], lr=a.lr_geo)
         print(f"[joint] vertex refinement from it {a.joint_from}, lr {a.lr_geo}, lap {a.geo_lap}, "
               f"sil {a.geo_sil}, re-cache every {a.recache_every}", flush=True)
+
+    orient = OrientationPrior(mesh.vertex_normals, vertex_observations(mesh, cache)) if a.orient_prior > 0 else None
 
     log = []
     if a.eval_only:
@@ -610,11 +708,22 @@ def main():
         if a.ssim > 0:
             l_img = (1 - a.ssim) * l_img + a.ssim * patch_dssim(loss_space(o["rgb"]),
                                                                  loss_space(cache["rgb"][idx].float()), patch_idx)
-        l_smooth = mat.edge_smoothness(edges, (a.smooth_albedo, a.smooth_rough), edge_w,
+        warm = it <= a.warmup
+        if a.learn_light and a.warmup and light.log_env.requires_grad:
+            opt.param_groups[-1]["lr"] = a.lr_light * (a.warmup_lr_mult if warm else 1.0) * \
+                a.lr_final_ratio ** (it / max(a.iters, 1))
+        l_smooth = mat.edge_smoothness(edges, (a.smooth_albedo * (a.warmup_smooth if warm else 1.0), a.smooth_rough),
+                                       edge_w,
                                        (a.smooth_normal, a.normal_anchor))
         loss = l_img + l_smooth
+        if orient is not None:
+            loss = loss + a.orient_prior * orient(mat.vertex_values()["albedo"])
+        if mat.atlas is not None and a.atlas_smooth > 0:
+            loss = loss + a.atlas_smooth * mat.atlas_smoothness()
         if a.learn_light:
             loss = loss + a.light_tv * light.tv() + a.light_wb * light.white_balance()
+            if a.light_sat > 0:
+                loss = loss + a.light_sat * light.saturation()
         l_sil = torch.zeros((), device="cuda")
         if geo_on:
             l_sil = geo.silhouette_loss(cur.vertices, random.sample(sil_views, a.sil_views), SKIP_TOP_ROWS)
@@ -670,6 +779,11 @@ def main():
             scale = (learned * gt).sum((0, 1)) / (learned * learned).sum((0, 1))
             light_metrics = {"light_psnr_aligned": psnr(tonemap(learned * scale), tonemap(gt)),
                              "light_scale_to_gt": scale.tolist()}
+            from relight.envmap import texel_directions        # energy below the horizon relative to above
+            td, sa = texel_directions(*learned.shape[:2], device=learned.device)
+            for name, L in (("light", learned), ("gt", gt)):
+                e = lambda sel: float((L.mean(-1) * sa * sel).sum())
+                light_metrics[f"{name}_lower_up_ratio"] = e(td[..., 2] < -0.1) / e(td[..., 2] > 0.1)
             from relight.io import write_exr
             write_exr(out_dir / "learned_envmap.exr", learned.cpu().numpy())
             write_png(out_dir / "envmap_learned_vs_gt.png",

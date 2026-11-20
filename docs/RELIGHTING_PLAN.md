@@ -844,3 +844,41 @@ jugs (learned light): relighting 38.51 → 38.44, roughness 0.0062 → 0.0067, C
   textures, interreflection) into Stage B rather than add vertex updates to the material stage. Expected gain is
   small: on SynthGeo the remaining geometry errors are observability (slab height) and undercuts, which the
   image loss does not constrain.
+
+### Light estimation: the lower-hemisphere gauge and the orientation prior (2026-11-20)
+
+Diagnosis (v9, learned light + interreflection): the learned-light albedo error sits on down- / side-facing
+surfaces (n_z < 0.1: −3…−8 dB vs the oracle fit; up-facing within ≈ 1 dB). The learned envmap's energy below the
+horizon is 2–3× too high (lower/upper ratio chair 0.38, hotdog 0.58 vs GT 0.19) and tinted with the object colour,
+inherited from the geometry stage's env.pt init (hotdog: mean |Δ log L| below the horizon 0.14 over the whole fit).
+With the oracle light chair has no orientation bias in albedo (median log(pred/GT) within ±0.03 in every n_z bin),
+so the shading model is right and the light is wrong: brighter light from below ↔ darker albedo on the surfaces
+facing down explain the images equally well. Albedo edge smoothness (TV averaged over all edges) does not
+penalise such a smooth top-to-bottom ramp.
+
+Fixes tried on chair / hotdog (eval stride 8): light warm-up (albedo smoothness ×20 and light lr ×4 for 1000 its,
+`--warmup`) helps chair (+0.74 dB relighting) but not hotdog and hurts jugs (roughness 0.0063 → 0.0097, −0.8 dB);
+a low-saturation light prior (`--light-sat`) is worse everywhere. Neither changes the lower-hemisphere excess.
+
+**Orientation prior** (`--orient-prior λ`, `train_pbr.py: OrientationPrior`): weighted variance of the part of
+per-vertex log-albedo explained by a degree-2 SH function of the normal (constant excluded; weights = vertex pixel
+observations; a fixed least-squares projector, so it costs one [9, V] mat-mul per iteration). GT check: orientation
+explains only 3–9 % of the GT log-albedo variance. λ is insensitive on chair / hotdog (0.3 ≈ 1 ≈ 3); λ = 0.1 is
+best on jugs / air_baloons. Default now 0.1 with `--learn-light` (0 with a known light). Four scenes, full eval:
+
+| v9 | NVS PSNR / LPIPS | Relight PSNR / SSIM / LPIPS | Albedo PSNR / SSIM / LPIPS | Rough MSE | Cycles GI vs GT | ReMeS vs GT | Parity | Light PSNR |
+|---|---|---|---|---|---|---|---|---|
+| learned (v9) | 36.12 / 0.044 | 34.61 / 0.973 / 0.057 | 30.04 / 0.953 / 0.068 | 0.0106 | 27.12 | 27.32 | 33.44 | 16.48 |
+| + interreflection | 36.37 / 0.043 | 35.04 / 0.973 / 0.057 | 30.18 / 0.954 / 0.066 | 0.0097 | 27.15 | 27.68 | 33.46 | 17.10 |
+| **+ orientation prior 0.1** | 36.39 / 0.043 | **35.40 / 0.974 / 0.056** | **30.88 / 0.955 / 0.064** | **0.0097** | **27.64** | **28.09** | 33.42 | **18.56** |
+| oracle + interreflection | 36.08 / 0.042 | 36.03 / 0.975 / 0.054 | 31.31 / 0.956 / 0.060 | 0.0092 | 28.48 | 28.77 | 33.32 | — |
+
+Per scene (relighting / albedo): chair 33.81 → 34.55 / 29.90 → 31.34, hotdog 32.50 → 32.94 / 28.29 → 29.30,
+air_baloons 35.36 → 35.68 / 27.06 → 27.28, jugs 38.51 → 38.36 / 35.49 → 35.57 (stride-8 values). The learned-light
+albedo gap to the oracle shrinks from 1.13 to 0.43 dB, the Cycles gap from 1.33 to 0.84 dB. Remaining: the
+lower hemisphere is still too bright on hotdog (0.44) and chair (0.30). A second prior of the same kind,
+albedo ⟂ occlusion, holds in GT (R² 0.001–0.026) but the error it would remove is only 4–10 % in the most
+occluded decile, with scene-dependent sign — expected gain a few tenths of a dB.
+
+Versus R3DG (Tab. 2): relighting 35.40 vs 31.00, albedo 30.88 vs 28.31, roughness MSE 0.0097 vs 0.013;
+NVS 36.39 vs 36.80, LPIPS 0.043 vs 0.028.

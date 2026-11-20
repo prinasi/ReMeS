@@ -80,9 +80,14 @@ def main():
         face_tiles["albedo"] = np.clip(face_tiles["albedo"] * np.asarray(scale, np.float32), 0, 1)
     with torch.no_grad():
         shade_n = mat.shading_normals(mesh.vertex_normals)                 # learned normals if any (glTF NORMAL)
+    uv_atlas = None
+    if mat.atlas is not None:                                    # shared UV atlas -> one baked texture set
+        uv_atlas = mat.bake_atlas()
+        uv_atlas["albedo"] = np.clip(uv_atlas["albedo"] * np.asarray(scale, np.float32), 0, 1)
+        uv_atlas["uv"] = mat.uv.cpu().numpy()
     rep = write_pbr_glb(mesh.vertices.cpu().numpy(), mesh.faces.cpu().numpy(), shade_n.cpu().numpy(),
                         albedo.cpu().numpy(), v["rough"].cpu().numpy(), v["metal"].cpu().numpy(), glb,
-                        tile_size=4, face_tiles=face_tiles)
+                        tile_size=4, face_tiles=face_tiles, uv_atlas=uv_atlas)
     print(f"[export] {rep['faces']:,} faces, {rep['pages']} page(s), {rep['bytes'] / 1e6:.1f} MB, albedo scale {scale}")
 
     args = torch.load(run / "material.pt", map_location="cpu", weights_only=False)["args"]

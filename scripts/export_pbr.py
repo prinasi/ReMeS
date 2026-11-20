@@ -23,9 +23,11 @@ from relight.mesh import load_relight_mesh  # noqa: E402
 def load_material(mesh, run_dir: Path) -> PBRMaterial:
     ck = torch.load(run_dir / "material.pt", map_location="cuda", weights_only=False)
     args = ck["args"]
+    A = args.get("atlas_res", 0)
     mat = PBRMaterial(mesh.faces, mesh.vertices.shape[0], face_res=args.get("face_res", 0),
                       learn_metallic=args.get("learn_metallic", False),
-                      learn_normals=args.get("learn_normals", False)).cuda()
+                      learn_normals=args.get("learn_normals", False), atlas_res=A,
+                      uv=torch.zeros(mesh.faces.shape[0], 3, 2) if A else None).cuda()
     mat.load_state_dict(ck["state_dict"])
     return mat
 
@@ -57,9 +59,15 @@ def main():
             face_tiles["albedo"] = np.clip(face_tiles["albedo"] * np.asarray(a.albedo_scale, np.float32), 0, 1)
     with torch.no_grad():
         shade_n = mat.shading_normals(mesh.vertex_normals)                 # learned normals if any (glTF NORMAL)
+    uv_atlas = None
+    if mat.atlas is not None:
+        uv_atlas = mat.bake_atlas()
+        if a.albedo_scale is not None:
+            uv_atlas["albedo"] = np.clip(uv_atlas["albedo"] * np.asarray(a.albedo_scale, np.float32), 0, 1)
+        uv_atlas["uv"] = mat.uv.cpu().numpy()
     rep = write_pbr_glb(mesh.vertices.cpu().numpy(), mesh.faces.cpu().numpy(), shade_n.cpu().numpy(),
                         albedo.cpu().numpy(), v["rough"].cpu().numpy(), v["metal"].cpu().numpy(), out,
-                        tile_size=a.tile_size, atlas_size=a.atlas_size, face_tiles=face_tiles)
+                        tile_size=a.tile_size, atlas_size=a.atlas_size, face_tiles=face_tiles, uv_atlas=uv_atlas)
     print(f"[export] {rep['faces']:,} faces, {rep['pages']} atlas page(s), {rep['bytes'] / 1e6:.1f} MB -> {out}")
 
 

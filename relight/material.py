@@ -7,6 +7,11 @@ gives implicit cross-face smoothing on these poorly connected meshes.
 
 Optional: per-face residual logits [F,R,R,C] in T²-Splat's barycentric texel layout
 (row = w2, column = w1, texel spacing 1/(R-1)); disabled when ``face_res == 0``.
+
+Optional (exclusive with per-face tiles): a shared UV atlas residual [C, A, A] sampled bilinearly at the
+interpolated per-corner UVs (``uv`` [F,3,2], Blender/bottom-left convention; image row 0 = top, i.e. v = 1),
+e.g. from relight/blender/uv_unwrap.py. Texels are continuous within a chart, so filtering / mipmaps work across
+triangle edges and the export is one standard texture set.
 """
 from __future__ import annotations
 
@@ -25,7 +30,8 @@ def _logit(p: float) -> float:
 class PBRMaterial(nn.Module):
     def __init__(self, faces: torch.Tensor, num_vertices: int, face_res: int = 0,
                  albedo_init: float | torch.Tensor = 0.5, rough_init: float = 0.5,
-                 metal_init: float = 0.0, learn_metallic: bool = False, learn_normals: bool = False):
+                 metal_init: float = 0.0, learn_metallic: bool = False, learn_normals: bool = False,
+                 atlas_res: int = 0, uv: torch.Tensor | None = None):
         super().__init__()
         self.register_buffer("faces", faces.long())
         dev = faces.device
@@ -44,6 +50,14 @@ class PBRMaterial(nn.Module):
             self.residual = nn.Parameter(torch.zeros(faces.shape[0], face_res, face_res, 5, device=dev))
         else:
             self.register_parameter("residual", None)
+        self.atlas_res = atlas_res
+        if atlas_res > 0:
+            assert face_res == 0 and uv is not None, "atlas needs UVs and excludes per-face tiles"
+            self.register_buffer("uv", uv.float().to(dev))
+            self.atlas = nn.Parameter(torch.zeros(1, 5, atlas_res, atlas_res, device=dev))
+            self.register_buffer("atlas_cover", torch.zeros(atlas_res, atlas_res, dtype=torch.bool, device=dev))
+        else:
+            self.register_parameter("atlas", None)
         # learnable shading normals: per-vertex offset added to the geometric vertex normal (exported as NORMAL)
         if learn_normals:
             self.normal_offset = nn.Parameter(torch.zeros(num_vertices, 3, device=dev))
@@ -82,7 +96,66 @@ class PBRMaterial(nn.Module):
         z = (bary[:, :, None] * self.vertex_logits()[tri]).sum(1)        # [N, 5]
         if self.residual is not None:
             z = z + self._sample_residual(face_id, bary)
+        if self.atlas is not None:
+            z = z + self._sample_atlas(face_id, bary)
         return self._activate(z)
+
+    def _sample_atlas(self, face_id, bary):
+        uv = (bary[:, :, None] * self.uv[face_id]).sum(1)                # [N, 2]
+        grid = torch.stack([uv[:, 0] * 2 - 1, 1 - 2 * uv[:, 1]], -1).reshape(1, -1, 1, 2)
+        out = torch.nn.functional.grid_sample(self.atlas, grid, mode="bilinear", padding_mode="border",
+                                              align_corners=False)
+        return out[0, :, :, 0].T                                         # [N, 5]
+
+    @torch.no_grad()
+    def uv_raster(self, res: int | None = None):
+        """Rasterise the UV layout: per texel (face id [-1 = empty], barycentrics) at atlas resolution."""
+        import nvdiffrast.torch as dr
+        from relight.gbuffer import get_context
+        R = res or self.atlas_res
+        F_ = self.uv.shape[0]
+        uv = self.uv.reshape(-1, 2)
+        clip = torch.stack([uv[:, 0] * 2 - 1, 1 - 2 * uv[:, 1], torch.zeros_like(uv[:, 0]),
+                            torch.ones_like(uv[:, 0])], -1)[None].contiguous()
+        tri = torch.arange(3 * F_, device=uv.device, dtype=torch.int32).reshape(F_, 3)
+        rast, _ = dr.rasterize(get_context(uv.device), clip, tri, resolution=[R, R])
+        r = rast[0]
+        fid = r[..., 3].long() - 1
+        bary = torch.stack([r[..., 0], r[..., 1], 1 - r[..., 0] - r[..., 1]], -1)
+        return fid, bary
+
+    def atlas_smoothness(self) -> torch.Tensor:
+        """Mean |Δ| of the atlas residual between 4-neighbour texels that are both covered (within charts)."""
+        t, c = self.atlas[0], self.atlas_cover
+        dx = (t[:, :, 1:] - t[:, :, :-1]).abs().mean(0)[c[:, 1:] & c[:, :-1]]
+        dy = (t[:, 1:] - t[:, :-1]).abs().mean(0)[c[1:] & c[:-1]]
+        return (dx.sum() + dy.sum()) / max(dx.numel() + dy.numel(), 1)
+
+    @torch.no_grad()
+    def bake_atlas(self, res: int | None = None, dilate: int = 8, chunk: int = 1 << 20) -> dict:
+        """Final albedo / rough / metal textures [R, R, ·] (row 0 = top) for export: base + residual at every
+        covered texel, then ``dilate`` rounds of neighbour filling into the empty texels (filtering margins)."""
+        fid, bary = self.uv_raster(res)
+        R = fid.shape[0]
+        out = torch.zeros(R * R, 5, device=fid.device)
+        cov = (fid >= 0).reshape(-1)
+        idx = cov.nonzero()[:, 0]
+        f, b = fid.reshape(-1), bary.reshape(-1, 3)
+        for s in range(0, idx.numel(), chunk):
+            i = idx[s:s + chunk]
+            v = self.sample(f[i], b[i])
+            out[i] = torch.cat([v["albedo"], v["rough"][:, None], v["metal"][:, None]], -1)
+        img = out.reshape(R, R, 5).permute(2, 0, 1)[None]
+        m = cov.reshape(1, 1, R, R).float()
+        for _ in range(dilate):
+            s_ = torch.nn.functional.avg_pool2d(img * m, 3, 1, 1)
+            w = torch.nn.functional.avg_pool2d(m, 3, 1, 1)
+            fill = (m == 0) & (w > 0)
+            img = torch.where(fill, s_ / w.clamp_min(1e-8), img)
+            m = torch.where(fill, torch.ones_like(m), m)
+        img = img[0].permute(1, 2, 0)
+        return {"albedo": img[..., :3].cpu().numpy(), "rough": img[..., 3].cpu().numpy(),
+                "metal": img[..., 4].cpu().numpy(), "coverage": float(cov.float().mean())}
 
     def _sample_residual(self, face_id, bary):
         R = self.face_res

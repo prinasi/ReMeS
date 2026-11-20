@@ -36,13 +36,17 @@ def _zup_to_yup(x: np.ndarray) -> np.ndarray:
 def write_pbr_glb(vertices: np.ndarray, faces: np.ndarray, normals: np.ndarray, albedo: np.ndarray,
                   rough: np.ndarray, metal: np.ndarray, out: str | Path, tile_size: int = 4,
                   padding: int = 1, atlas_size: int = 4096, double_sided: bool = True,
-                  chunk_faces: int = 65536, face_tiles: dict | None = None) -> dict:
+                  chunk_faces: int = 65536, face_tiles: dict | None = None, uv_atlas: dict | None = None) -> dict:
     """vertices/normals [V,3] (Blender Z-up world), faces [F,3], albedo [V,3] linear,
     rough/metal [V]. Returns an export report.
 
     face_tiles (optional): per-face texel values in the same tile layout, overriding the per-vertex bake:
     {"albedo": [F, T, T, 3] linear, "rough": [F, T, T], "metal": [F, T, T]} with T == tile_size
-    (e.g. PBRMaterial.face_texel_values for materials with per-face residual textures)."""
+    (e.g. PBRMaterial.face_texel_values for materials with per-face residual textures).
+
+    uv_atlas (optional, replaces the tile atlas): a shared UV atlas {"uv": [F, 3, 2] (Blender convention, origin
+    bottom-left), "albedo": [R, R, 3] linear, "rough": [R, R], "metal": [R, R]} (row 0 = top, PBRMaterial.bake_atlas);
+    one primitive, mipmapped trilinear sampler (charts are continuous and dilated)."""
     out = Path(out)
     out.parent.mkdir(parents=True, exist_ok=True)
     faces = np.asarray(faces, dtype=np.int64)
@@ -85,7 +89,28 @@ def write_pbr_glb(vertices: np.ndarray, faces: np.ndarray, normals: np.ndarray, 
         return len(gltf["textures"]) - 1
 
     pages = 0
-    for first in range(0, len(faces), capacity):
+    if uv_atlas is not None:
+        q = lambda t: np.floor(np.clip(t, 0, 1) * 255 + .5).astype(np.uint8)
+        base_img = q(linear_to_srgb(np.clip(np.asarray(uv_atlas["albedo"], np.float32), 0, 1)))
+        r_, m_ = np.asarray(uv_atlas["rough"]), np.asarray(uv_atlas["metal"])
+        orm_img = q(np.stack([np.ones_like(r_), r_, m_], -1))
+        gltf["samplers"][0]["minFilter"] = 9987                          # LINEAR_MIPMAP_LINEAR
+        uv = np.asarray(uv_atlas["uv"], np.float32).reshape(-1, 2).copy()
+        uv[:, 1] = 1 - uv[:, 1]                                          # glTF: origin top-left
+        tb, tm = image(base_img), image(orm_img)
+        gltf["materials"].append({"name": "remes_pbr_atlas", "doubleSided": double_sided, "alphaMode": "OPAQUE",
+                                  "pbrMetallicRoughness": {"baseColorFactor": [1, 1, 1, 1],
+                                                           "baseColorTexture": {"index": tb},
+                                                           "metallicFactor": 1.0, "roughnessFactor": 1.0,
+                                                           "metallicRoughnessTexture": {"index": tm}}})
+        gltf["meshes"][0]["primitives"].append({"attributes": {
+            "POSITION": accessor(_zup_to_yup(np.asarray(vertices, np.float32)[faces].reshape(-1, 3)), "VEC3",
+                                 bounds=True),
+            "NORMAL": accessor(_zup_to_yup(nrm[faces].reshape(-1, 3)), "VEC3"),
+            "TEXCOORD_0": accessor(uv, "VEC2")}, "material": 0, "mode": 4})
+        pages = 1
+        atlas_size = base_img.shape[0]
+    for first in range(0, len(faces) if uv_atlas is None else 0, capacity):
         last = min(first + capacity, len(faces))
         atlases = [np.zeros((atlas_size, atlas_size, 3), np.uint8) for _ in range(2)]
         for s in range(first, last, chunk_faces):

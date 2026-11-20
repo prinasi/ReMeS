@@ -173,6 +173,17 @@ class LearnableEnvLight(torch.nn.Module):
         t = self.log_env
         return (t - t.roll(1, dims=1)).abs().mean() + (t[1:] - t[:-1]).abs().mean()
 
+    def saturation(self) -> torch.Tensor:
+        """Solid-angle-weighted variance of the log-chroma (log L minus its channel mean) across directions:
+        penalises direction-dependent tint (e.g. object colour leaking into weakly observed light directions)
+        while leaving the global light colour and the luminance pattern free."""
+        t = self.log_env
+        c = t - t.mean(-1, keepdim=True)
+        w = self.solid.reshape(t.shape[:2] + (1,))
+        w = w / w.sum()
+        mean = (c * w).sum((0, 1), keepdim=True)
+        return ((c - mean) ** 2 * w).sum()
+
     def white_balance(self) -> torch.Tensor:
         m = (self.env * self.solid.reshape(self.log_env.shape[:2] + (1,))).sum((0, 1))
         return ((m - m.mean()) / m.mean().clamp_min(1e-6)).pow(2).mean()
