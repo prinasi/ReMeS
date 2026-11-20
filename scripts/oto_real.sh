@@ -25,7 +25,7 @@ for scene in "$@"; do
     run "$ROOT/scripts/eval_blender.py" -m "$M" --scene "$scene" --run pbr_oracle
     if [ -n "${LEARN_LIGHT:-}" ]; then                      # Phase 3: learned training light
         run "$ROOT/scripts/train_pbr.py" -m "$M" --scene "$scene" --learn-light --lr-light 5e-3 \
-            --face-res 4 --learn-normals --ssim 0.2 --out pbr_learned
+            --atlas-res 2048 --learn-normals --ssim 0.2 --out pbr_learned
         run "$ROOT/scripts/eval_blender.py" -m "$M" --scene "$scene" --run pbr_learned
     fi
     echo "=== [$scene] done"

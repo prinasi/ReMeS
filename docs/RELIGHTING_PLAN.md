@@ -882,3 +882,33 @@ occluded decile, with scene-dependent sign — expected gain a few tenths of a d
 
 Versus R3DG (Tab. 2): relighting 35.40 vs 31.00, albedo 30.88 vs 28.31, roughness MSE 0.0097 vs 0.013;
 NVS 36.39 vs 36.80, LPIPS 0.043 vs 0.028.
+
+### Appearance capacity: per-vertex vs per-face tiles vs a shared UV atlas (2026-11-20)
+
+Question: per-vertex appearance ties material resolution to the (geometry-adaptive) tessellation; per-face tiles
+decouple it but are an engine-unfriendly layout (seams, no mipmaps, half the texels mirrored). New option
+`--atlas-res R`: per-vertex base + a residual texture in a shared UV atlas, sampled bilinearly at the interpolated
+corner UVs (`PBRMaterial.atlas`, optional within-chart smoothness `--atlas-smooth`); UVs from xatlas
+(`--uv-method xatlas`, default; 2272–4049 charts, 63–81 % utilisation, 35–60 s, cached as
+`<model>/uv_xatlas_<R>.npz`) or Blender Smart UV Project + concave packing (`relight/blender/uv_unwrap.py`, 50 %).
+Export bakes base + residual per texel (UV-space nvdiffrast raster, 8-texel dilation) into one baseColor + one
+metallicRoughness texture with a mipmapped sampler (`tests/test_atlas.py`: train / bake / GLB conventions).
+
+Four scenes, v9, learned light + interreflection + orientation prior (all else equal):
+
+| | NVS PSNR / LPIPS | Relight PSNR / LPIPS | Albedo PSNR / LPIPS | Rough MSE | Parity | Cycles GI vs GT | ReMeS vs GT | GLB |
+|---|---|---|---|---|---|---|---|---|
+| per-vertex only | 35.75 / 0.058 | 34.89 / 0.069 | 30.38 / 0.073 | 0.0107 | 33.42 | 27.19 | 27.64 | 25 MB |
+| per-face tiles 4×4 | 36.39 / 0.043 | 35.40 / 0.056 | 30.88 / 0.064 | 0.0097 | 33.42 | 27.64 | 28.09 | 30 MB |
+| **atlas 2048²** | 36.38 / **0.042** | **35.43 / 0.056** | **30.94 / 0.064** | **0.0090** | **33.55** | **27.71** | 28.09 | 30 MB |
+| atlas 4096² | 35.97 / 0.046 | 35.29 / 0.056 | 30.80 / 0.074 | 0.0078 | 33.47 | 27.62 | 27.84 | 61 MB |
+| atlas 4096² + smooth 0.01 | 36.19 / 0.044 | 35.35 / 0.055 | 30.86 / 0.070 | 0.0084 | 33.53 | 27.65 | 27.97 | 55 MB |
+
+* Per-vertex appearance is indeed limiting: −0.5 dB relighting and albedo, LPIPS +0.013–0.015 everywhere.
+* The 2048² atlas matches or beats the per-face tiles on every metric at the same file size, with roughness
+  MSE lower on all four scenes (0.0097 → 0.0090) and higher Blender parity; it is a single standard,
+  mipmappable texture set. Now the learned-light setting of `scripts/oto_real.sh`.
+* 4096² overfits (roughness keeps improving, albedo LPIPS / NVS degrade); within-chart smoothness recovers part.
+* Baking check (median log albedo bias vs GT, most occluded decile / down-facing vs the rest): unchanged or
+  smaller with the atlas (chair −0.24 → −0.21, hotdog −0.10 → −0.06 down-facing; occlusion ±0.03) — the extra
+  capacity does not absorb shadows or the light gauge.
